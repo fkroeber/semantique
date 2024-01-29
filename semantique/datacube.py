@@ -930,7 +930,11 @@ class STACCube(Datacube):
                     data = data.where(data != self.config["na_value"])
                     data = data.groupby(days).first(skipna=True).rename({"floor": "time"})
                 else:
-                    data = data.groupby(days).reduce(_mosaic_ints, na_value=self.config["na_value"]).rename({"floor": "time"})
+                    data = (
+                      data.groupby(days)
+                      .reduce(_mosaic_ints, na_value=self.config["na_value"])
+                      .rename({"floor": "time"})
+                    )
                 data["time"] = data.time.values
 
         return data

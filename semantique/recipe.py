@@ -94,3 +94,68 @@ class QueryRecipe(dict):
       # executing the query recipe
       qp = QueryProcessor.parse(self, datacube, mapping, space, time, **config)
       return qp.optimize().execute()
+
+
+  def execute_tiled(
+    self, datacube, mapping, space, time, caching=False,
+    chunksize_t="1W", chunksize_s=1024, merge="direct",
+    **config
+  ):
+    """Execute a query recipe in a tiled manner.
+
+    This function divides the spatio-temporal extent into smaller tiles, calls 
+    :obj:`QueryRecipe.execute` for each of them, and aggregates the results. The
+    tiling is handled by a :obj:`TileHandler`.
+
+    Parameters
+    ----------
+      datacube : Datacube
+        The datacube instance to process the query against.
+      mapping : Mapping
+        The mapping instance to process the query against.
+      space : SpatialExtent
+        The spatial extent in which the query should be processed.
+      time : TemporalExtent
+        The temporal extent in which the query should be processed.
+      caching : :obj:`bool`
+        Should the query processor cache the data references as provided by the
+        mapped concepts? Enabling caching increases the memory footprint while
+        reducing the I/O time to read data. Will be used only if query recipe
+        contains concepts referencing the same data layer multiple times.
+      chunksize_t : :obj:`str`
+        tbd
+      chunksize_s : :obj:`int`
+        tbd
+      merge : :obj:`str`
+        tbd - either direct or vrt
+      **config:
+        Additional configuration parameters forwarded to
+        :func:`QueryProcessor.parse <processor.core.QueryProcessor.parse>`.
+
+    Returns
+    -------
+      :obj:`dict` of :obj:`xarray.DataArray`:
+        The response of the query processor as a dictionary containing result
+        names as keys and result arrays as values.
+
+    Examples - tbd 
+    --------
+    >>> import semantique as sq
+    >>> import geopandas as pd
+
+    >>> recipe = sq.QueryRecipe()
+    >>> recipe["map"] = sq.entity("water").reduce("time", "count")
+    >>> recipe["series"] = sq.entity("water").reduce("space", "count")
+
+    >>> dc = sq.datacube.GeotiffArchive("files/layout_gtiff.json", src = "layers_gtiff.zip")
+    >>> mapping = sq.mapping.Semantique("files/mapping.json")
+    >>> space = sq.SpatialExtent(gpd.read_file("files/footprint.geojson"))
+    >>> time = sq.TemporalExtent("2019-01-01", "2020-12-31")
+    >>> config = {"crs": 3035, "tz": "UTC", "spatial_resolution": [-1800, 1800]}
+
+    >>> recipe.execute(dc, mapping, space, time, **config)
+
+    """
+    # executing the query recipe
+    qp = QueryProcessor.parse(self, datacube, mapping, space, time, **config)
+    return qp.optimize().execute()
