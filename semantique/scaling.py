@@ -303,9 +303,7 @@ class TileHandler:
         for k, s in merge_dict.items():
             max_length = max(len(lyr) for lyr in response)
             max_length = max(max_length, len("Total size")) + 3
-            total_size = sum(
-                (s * response[lyr].nbytes / (1024**3)) for lyr in response
-            )
+            total_size = sum((s * response[lyr].nbytes / (1024**3)) for lyr in response)
             print("----------------------------------------")
             print(f"Scenario: {k}")
             print("----------------------------------------")
@@ -345,11 +343,8 @@ class TileHandler:
         """Execute the workflow and handle response."""
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            try:
-                response = self.recipe.execute(**context)
-                return response
-            except exceptions.EmptyDataError as e:
-                warnings.warn(e)
+            response = self.recipe.execute(**context)
+            return response
 
     @staticmethod
     def get_op_dims(recipe_piece, results=None):

@@ -878,7 +878,7 @@ class STACCube(Datacube):
         # Mask invalid data.
         data = self._mask(data)
         if data.sq.is_empty:
-            raise exceptions.EmptyDataError(
+            warnings.warn(
                 f"All values for data layer '{reference}' are invalid within the "
                 "specified spatio-temporal extent"
             )
