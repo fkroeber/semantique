@@ -1,3 +1,5 @@
+# tbd: see vrt.py (smail for colortable & relative paths improvements)
+
 from contextlib import contextmanager
 import os
 import math

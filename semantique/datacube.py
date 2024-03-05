@@ -814,30 +814,34 @@ class STACCube(Datacube):
     def layout(self, value):
         self._layout = {} if value is None else self._parse_layout(value)
 
+    # tbd: update _parse_layout function as below for all cubes
+    # previously: ill-defined else part of _parse function
+    # k referenced before assigninment, possibility of endless iterations
     def _parse_layout(self, obj):
-        # Makes the metadata objects of the data layers autocomplete friendly.
-        def _parse(obj, ref):
-            is_layer = False
-            while not is_layer:
-                if all([x in obj for x in ["type", "values"]]):
-                    obj["reference"] = copy.deepcopy(ref)
-                    if isinstance(obj["values"], list):
-                        obj["labels"] = {x["label"]: x["id"] for x in obj["values"]}
-                        obj["descriptions"] = {
-                            x["description"]: x["id"] for x in obj["values"]
-                        }
-                    del ref[-1]
-                    is_layer = True
-                else:
-                    ref.append(k)
-                    for k, v in obj.items():
-                        _parse(v, ref)
+        # Function to recursively parse and metadata objects to make them autocomplete friendly
+        def _parse(current_obj, ref_path):
+            if "type" in current_obj and "values" in current_obj:
+                current_obj["reference"] = copy.deepcopy(ref_path)
+                if isinstance(current_obj["values"], list):
+                    current_obj["labels"] = {
+                        item["label"]: item["id"] for item in current_obj["values"]
+                    }
+                    current_obj["descriptions"] = {
+                        item["description"]: item["id"]
+                        for item in current_obj["values"]
+                    }
+                return
 
-        for k, v in obj.items():
-            ref = [k]
-            for k, v in v.items():
-                ref.append(k)
-                _parse(v, ref)
+            # If not a "layer", traverse deeper into the object.
+            for key, value in current_obj.items():
+                if isinstance(value, dict):
+                    new_ref_path = ref_path + [key]
+                    _parse(value, new_ref_path)
+
+        # Start parsing from the root object.
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                _parse(value, [key])
         return obj
 
     def retrieve(self, *reference, extent):
@@ -975,25 +979,27 @@ class STACCube(Datacube):
         return data
 
     def _format(self, data, metadata, extent):
-        # Step I: Drop unnecessary dimensions & coordinates.
+        # Step I: Set band as array name.
+        data.name = str(data["band"][0].values)
         data = data.squeeze(dim="band", drop=True)
+        # Step II: Drop unnecessary dimensions & coordinates.
         keep_coords = ["time", data.rio.x_dim, data.rio.y_dim]
         drop_coords = [x for x in list(data.coords) if x not in keep_coords]
         data = data.drop_vars(drop_coords)
-        # Step II: Format temporal coordinates.
+        # Step III: Format temporal coordinates.
         # --> Make sure time dimension has the correct name.
         # --> Convert time coordinates back into the original timezone.
         data = data.sq.rename_dims({"time": TIME})
         data = data.sq.write_tz(self.tz)
         data = data.sq.tz_convert(extent.sq.tz)
-        # Step III: Format spatial coordinates.
+        # Step IV: Format spatial coordinates.
         # --> Make sure X and Y dims have the correct names.
         # --> Store resolution as an attribute of the spatial coordinate dimensions.
         # --> Add spatial feature indices as a non-dimension coordinate.
         data = data.sq.rename_dims({data.rio.y_dim: Y, data.rio.x_dim: X})
         data = data.sq.write_spatial_resolution(extent.sq.spatial_resolution)
         data.coords["spatial_feats"] = ([Y, X], extent["spatial_feats"].data)
-        # Step IV: Write semantique specific attributes.
+        # Step V: Write semantique specific attributes.
         # --> Value types for the data and all dimension coordinates.
         # --> Mapping from category labels to indices for all categorical data.
         data.sq.value_type = self.config["value_type_mapping"][metadata["type"]]

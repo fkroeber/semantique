@@ -881,8 +881,8 @@ class Array():
         raise exceptions.UnknownDimensionError(
           f"Dimension '{dimension}' is not present in the array"
         )
-      if extrapolate:
-        kwargs.update({"fill_value": "extrapolate"})
+      # if extrapolate:
+      #   kwargs.update({"fill_value": "extrapolate"})
       out = obj.interpolate_na(dimension, method = method, **kwargs)
     return out
 
