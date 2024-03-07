@@ -17,6 +17,7 @@ import warnings
 from datacube.utils import masking
 from abc import abstractmethod
 
+from rasterio.errors import RasterioIOError
 from semantique import exceptions
 from semantique.dimensions import TIME, SPACE, X, Y
 from semantique.exceptions import EmptyDataError
@@ -930,6 +931,10 @@ class STACCube(Datacube):
                     resolution=res,
                     fill_value=self.config["na_value"],
                     dtype=self.config["dtype"],
+                    rescale=False,  # to allow reading as provided int type
+                    # errors_as_nodata=(
+                    #     RasterioIOError(".*"),
+                    # ),  # to skip wrongly formatted files (Landsat)
                     xy_coords="center",
                     snap_bounds=False,
                 )

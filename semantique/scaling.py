@@ -5,6 +5,7 @@ import pandas as pd
 import warnings
 import xarray as xr
 
+from copy import deepcopy
 from itertools import product
 from multiprocess import Pool
 from rioxarray.merge import merge_arrays
@@ -13,9 +14,9 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
 import semantique as sq
-from semantique import exceptions
 from semantique.extent import SpatialExtent, TemporalExtent
 from semantique.processor.arrays import Collection
+from semantique.processor.core import QueryProcessor
 from semantique.vrt import virtual_merge
 
 
@@ -51,6 +52,7 @@ class TileHandler:
         tile_dim=None,
         merge="direct",
         out_dir=None,
+        caching=False,
         verbose=False,
         **config,
     ):
@@ -65,6 +67,7 @@ class TileHandler:
         self.tile_dim = tile_dim
         self.merge = merge
         self.out_dir = out_dir
+        self.caching = caching
         self.verbose = verbose
         self.config = config
         self.setup()
@@ -73,13 +76,14 @@ class TileHandler:
         # init necessary attributes
         self.grid = None
         self.tile_results = []
+        self.cache = None
         # retrieve crs information
         if not self.crs:
             self.crs = self.space.crs
         # retrieve tiling dimension
         self.get_tile_dim()
         # check output options
-        if self.merge == "vrt" and self.tile_dim == "time":
+        if self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
             raise NotImplementedError(
                 "If tiling is done along the temporal dimension, only 'direct' is "
                 "available as a merge strategy for now."
@@ -88,8 +92,8 @@ class TileHandler:
             raise ValueError(
                 "An 'out_dir' argument must be provided when merge is set to 'vrt'."
             )
-        elif self.merge == "vrt" and self.out_dir:
-            os.makedirs(self.out_dir)
+        # create output directory
+        os.makedirs(self.out_dir)
 
     def get_tile_dim(self):
         """Returns dimension usable for tiling & parallelisation of recipe execution.
@@ -107,21 +111,21 @@ class TileHandler:
         # retrieve tile dimension as non-used dimension
         if reduce_dims is None:
             if not self.tile_dim:
-                self.tile_dim = "space"
-        elif reduce_dims == ["time"]:
+                self.tile_dim = sq.dimensions.SPACE
+        elif reduce_dims == [sq.dimensions.TIME]:
             if self.tile_dim:
-                if self.tile_dim != "space":
+                if self.tile_dim != sq.dimensions.SPACE:
                     warnings.warn(
                         f"Tiling dimension {self.tile_dim} will be overwritten. Tiling dimension is set to 'space'."
                     )
-            self.tile_dim = "space"
-        elif reduce_dims == ["space"]:
+            self.tile_dim = sq.dimensions.SPACE
+        elif reduce_dims == [sq.dimensions.SPACE]:
             if self.tile_dim:
-                if self.tile_dim != "time":
+                if self.tile_dim != sq.dimensions.TIME:
                     warnings.warn(
                         f"Tiling dimension {self.tile_dim} will be overwritten. Tiling dimension is set to 'time'."
                     )
-            self.tile_dim = "time"
+            self.tile_dim = sq.dimensions.TIME
         else:
             warnings.warn("Tiling not feasible. Tiling dimension is set to 'None'.")
             self.tile_dim = None
@@ -131,37 +135,43 @@ class TileHandler:
         subsequent sequential iteration over small sub-parts of the total extent object
         via .execute().
         """
-        if self.tile_dim == "time":
+        if self.tile_dim == sq.dimensions.TIME:
             # create temporal grid
             self.grid = self.create_temporal_grid(
                 self.time["start"], self.time["end"], self.chunksize_t
             )
 
-        elif self.tile_dim == "space":
+        elif self.tile_dim == sq.dimensions.SPACE:
             # create spatial grid
+            if self.merge == "vrt":
+                precise = False
+            else:
+                precise = True
             self.grid = self.create_spatial_grid(
                 self.space,
                 self.spatial_resolution,
                 self.chunksize_s,
                 self.crs,
-                precise=False,
+                precise=precise,
             )
 
     def execute(self):
         """Runs the QueryProcessor.execute() method for all tiles."""
-        # preliminaries
-        if not self.grid:
-            self.get_tile_grid()
+        # dry-run is required
+        # read cache and write to object to read from for all subsequent calls
+        self.estimate_size()
 
         for i, tile in tqdm(
             enumerate(self.grid), disable=not self.verbose, total=len(self.grid)
         ):
             # run workflow for single tile
-            context = self._create_context(**{self.tile_dim: tile})
-            response = self._execute_workflow(context)
+            context = self._create_context(
+                **{self.tile_dim: tile}, cache=deepcopy(self.cache)
+            )
+            _, response = self._execute_workflow(context)
 
             # handle reponse
-            # note: no response may occur in cases where self.tile_dim=="time"
+            # note: no response may occur in cases where self.tile_dim==sq.dimensions.TIME
             if response:
                 # write result (in-memory or to disk)
                 if self.merge == "direct":
@@ -204,9 +214,9 @@ class TileHandler:
             # retrieve partial results
             src_arr = [x[k] for x in self.tile_results]
             # if temporal result
-            if self.tile_dim == "time":
+            if self.tile_dim == sq.dimensions.TIME:
                 if isinstance(src_arr[0], xr.core.dataarray.DataArray):
-                    joint_res[k] = xr.concat(src_arr, dim="time")
+                    joint_res[k] = xr.concat(src_arr, dim=sq.dimensions.TIME)
                 elif isinstance(src_arr[0], Collection):
                     arrs = []
                     # merge collection results
@@ -216,33 +226,100 @@ class TileHandler:
                         arr = arr.assign_coords(grouper=grouper_vals)
                         arrs.append(arr)
                     # merge across time
-                    joint_arr = xr.concat(arrs, dim="time")
+                    joint_arr = xr.concat(arrs, dim=sq.dimensions.TIME)
                     joint_arr.name = k
                     joint_res[k] = joint_arr
                 else:
                     raise ValueError("Not implemented.")
             # if spatial result
-            elif self.tile_dim == "space":
-                arrs = []
-                for arr in src_arr:
-                    new_arr = xr.DataArray(
-                        data=np.expand_dims(arr.values, 0),
-                        coords=dict(
-                            band=(["band"], np.array([1])),
-                            y=(["y"], arr["y"].values),
-                            x=(["x"], arr["x"].values),
-                        ),
-                        attrs=arr.attrs,
-                    ).rio.write_crs(self.crs)
-                    arrs.append(new_arr)
-                merged_arr = merge_arrays(arrs, crs=self.crs)
-                merged_arr = merged_arr[0].drop_vars("band")
-                joint_res[k] = merged_arr
+            elif self.tile_dim == sq.dimensions.SPACE:
+                # get dimensions of input array
+                arr_dims = list(src_arr[0].dims)
+                # remove spatial dimensions
+                if sq.dimensions.X in arr_dims:
+                    arr_dims.remove(sq.dimensions.X)
+                if sq.dimensions.Y in arr_dims:
+                    arr_dims.remove(sq.dimensions.Y)
+                # check if 2D/3D input arrays
+                if len(arr_dims):
+                    # possibly remaining dimension is the temporal one (e.g. year, season, etc)
+                    # retrieve temporal values
+                    time_dim = arr_dims[0]
+                    time_vals = [x[time_dim] for x in src_arr]
+                    time_vals = np.unique(xr.concat(time_vals, dim=time_dim).values)
+                    # for each timestep merge results spatially first
+                    arrs_main = []
+                    for time_val in time_vals:
+                        arrs_sub = []
+                        for arr in src_arr:
+                            # slice array for given timestep
+                            try:
+                                arr_slice = arr.sel(**{time_dim: time_val})
+                            except KeyError:
+                                continue
+                            # introduce band coordinate as index variable
+                            coords = {}
+                            coords["band"] = (["band"], np.array([1]))
+                            coords.update(
+                                {
+                                    dim: (dim, arr_slice[dim].values)
+                                    for dim in arr_slice.dims
+                                }
+                            )
+                            new_arr = xr.DataArray(
+                                data=np.expand_dims(arr_slice.values, 0),
+                                coords=coords,
+                                attrs=arr_slice.attrs,
+                            )
+                            new_arr = new_arr.rio.write_crs(self.crs)
+                            arrs_sub.append(new_arr)
+                        # spatial merge
+                        merged_arr = merge_arrays(arrs_sub, crs=self.crs)
+                        merged_arr = merged_arr[0].drop_vars("band")
+                        # re-introducing time dimension
+                        coords = {}
+                        coords[time_dim] = ([time_dim], np.array([time_val]))
+                        coords.update(
+                            {
+                                dim: (dim, merged_arr[dim].values)
+                                for dim in merged_arr.dims
+                            }
+                        )
+                        new_arr = xr.DataArray(
+                            data=np.expand_dims(merged_arr.values, 0),
+                            coords=coords,
+                            attrs=merged_arr.attrs,
+                        )
+                        new_arr = new_arr.rio.write_crs(self.crs)
+                        arrs_main.append(new_arr)
+                    # merge across time
+                    joint_arr = xr.concat(arrs_main, dim=time_dim)
+                else:
+                    # direct spatial merge possible
+                    arrs = []
+                    for arr in src_arr:
+                        # introduce band coordinate as index variable
+                        coords = {}
+                        coords["band"] = (["band"], np.array([1]))
+                        coords.update({dim: (dim, arr[dim].values) for dim in arr.dims})
+                        new_arr = xr.DataArray(
+                            data=np.expand_dims(arr.values, 0),
+                            coords=coords,
+                            attrs=arr.attrs,
+                        )
+                        new_arr = new_arr.rio.write_crs(self.crs)
+                        arrs.append(new_arr)
+                    # spatial merge
+                    joint_arr = merge_arrays(arrs, crs=self.crs)
+                    joint_arr = joint_arr[0].drop_vars("band")
+                # rename & write to overall dict
+                joint_arr.name = k
+                joint_res[k] = joint_arr
         self.joint_res = joint_res
         # write to out_dir
         if self.out_dir:
             for k, v in self.joint_res.items():
-                out_path = os.path.join(self.joint_res, f"{k}.tif")
+                out_path = os.path.join(self.out_dir, f"{k}.tif")
                 self.joint_res[k].rio.to_raster(out_path)
 
     def estimate_size(self):
@@ -265,17 +342,23 @@ class TileHandler:
             "is choosen the numbers indicate a lower bound for how much RAM is required "
             "since the individual tile results will be stored there before merging.\n"
         )
-        if self.tile_dim == "time":
+        if self.tile_dim == sq.dimensions.TIME:
             raise NotImplementedError(time_info)
-        elif self.tile_dim == "space":
+        elif self.tile_dim == sq.dimensions.SPACE:
             print(space_info)
         if not self.grid:
             self.get_tile_grid()
 
         # preview run of workflow for a single tile
         tile = self.grid[0]
-        context = self._create_context(**{self.tile_dim: tile}, preview=True)
-        response = self._execute_workflow(context)
+        context = self._create_context(
+            **{self.tile_dim: tile}, preview=True, cache=None
+        )
+        qp, response = self._execute_workflow(context)
+
+        # init cache
+        if self.caching:
+            self.cache = qp.cache
 
         # retrieve amount of pixels for given spatial extent
         total_bbox = self.space._features.to_crs(self.crs).total_bounds
@@ -291,7 +374,7 @@ class TileHandler:
         merge_dict = {"merge (direct)": scale_f1, "merge (vrt)": scale_f2}
 
         # return scaled numbers for each response
-        max_length = max(len(l) for l in response) + 1
+        max_length = max(len(r) for r in response) + 1
         print("----------------------------------------")
         print("General layer info")
         print("----------------------------------------")
@@ -343,30 +426,50 @@ class TileHandler:
         """Execute the workflow and handle response."""
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            response = self.recipe.execute(**context)
-            return response
+            # response = self.recipe.execute(**context)
+            qp = QueryProcessor.parse(self.recipe, **context)
+            response = qp.optimize().execute()
+            return qp, response
 
     @staticmethod
-    def get_op_dims(recipe_piece, results=None):
+    def get_op_dims(recipe_piece, dims=None):
         """Retrieves the dimensions over which operations take place.
         All operations indicated by verbs (such as reduce, groupby, etc) are considered.
         """
-        if results is None:
-            results = []
+        if dims is None:
+            dims = []
         if isinstance(recipe_piece, dict):
             # check if this dictionary matches the criteria
             if recipe_piece.get("type") == "verb":
                 dim = recipe_piece.get("params").get("dimension")
                 if dim:
-                    results.append(dim)
+                    dims.append(dim)
             # recursively search for values
             for value in recipe_piece.values():
-                TileHandler.get_op_dims(value, results)
+                TileHandler.get_op_dims(value, dims)
         elif isinstance(recipe_piece, list):
             # if it's a list apply the function to each item in the list
             for item in recipe_piece:
-                TileHandler.get_op_dims(item, results)
-        return list(np.unique(results))
+                TileHandler.get_op_dims(item, dims)
+        # categorise used dimensions into temporal & spatial dimensions
+        dim_lut = {
+            sq.dimensions.TIME: sq.dimensions.TIME,
+            sq.dimensions.SPACE: sq.dimensions.SPACE,
+        }
+        dim_lut.update(
+            {
+                x: sq.dimensions.TIME
+                for x in TileHandler._get_class_components(sq.components.time).values()
+            }
+        )
+        dim_lut.update(
+            {
+                x: sq.dimensions.SPACE
+                for x in TileHandler._get_class_components(sq.components.space).values()
+            }
+        )
+        dims = list(np.unique([dim_lut[x] for x in dims]))
+        return dims
 
     @staticmethod
     def create_temporal_grid(t_start, t_end, chunksize_t):
@@ -416,3 +519,16 @@ class TileHandler:
                 if space.intersects(bbox_tile.unary_union).iloc[0]:
                     spatial_grid.append(SpatialExtent(bbox_tile))
         return spatial_grid
+
+    @staticmethod
+    def _get_class_components(class_obj):
+        """
+        Function to get all components of the class along with their values
+        """
+        components = {}
+        for attribute in dir(class_obj):
+            if not attribute.startswith("__") and not callable(
+                getattr(class_obj, attribute)
+            ):
+                components[attribute] = getattr(class_obj, attribute)
+        return components
