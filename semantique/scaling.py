@@ -22,6 +22,7 @@ from semantique.vrt import virtual_merge
 
 class TileHandler:
     """Handler for executing a query in a (spatially or temporally) tiled manner.
+    Currently only supports non-grouped outputs (at least spatially).
 
     Parameters
     ----------
@@ -33,10 +34,12 @@ class TileHandler:
       time : tbd
       chunksize_t : tbd
       chunksize_s : tbd
-      merge : tbd
+      merge : one of ["vrt", "single", None], see Notes
       **config :
         Additional configuration parameters forwarded to QueryRecipe.execute.
         See :class:`QueryRecipe`, respectively :class:`QueryProcessor`.
+
+    Notes: "vrt" requires recipe to not use trim and
     """
 
     def __init__(
@@ -50,7 +53,7 @@ class TileHandler:
         chunksize_t="1W",
         chunksize_s=1024,
         tile_dim=None,
-        merge="direct",
+        merge="single",
         out_dir=None,
         caching=False,
         verbose=False,
@@ -82,18 +85,26 @@ class TileHandler:
             self.crs = self.space.crs
         # retrieve tiling dimension
         self.get_tile_dim()
-        # check output options
-        if self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
-            raise NotImplementedError(
-                "If tiling is done along the temporal dimension, only 'direct' is "
-                "available as a merge strategy for now."
+        # check merge-dependent prerequisites
+        if self.merge == "vrt":
+            warnings.warn(
+                "merge == vrt requires all outputs to have the same shape. "
+                "Ensure that the recipe does not contain any trim operations. "
+                "The datacube configuration will be set to trim=False."
             )
-        elif self.merge == "vrt" and not self.out_dir:
+            self.datacube.config["trim"] = False
+        elif self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
+            raise NotImplementedError(
+                "If tiling is done along the temporal dimension, 'vrt' is "
+                "currently not available as a merge strategy."
+            )
+        elif (self.merge == "vrt" or self.merge is None) and not self.out_dir:
             raise ValueError(
-                "An 'out_dir' argument must be provided when merge is set to 'vrt'."
+                f"An 'out_dir' argument must be provided when merge is set to {self.merge}."
             )
         # create output directory
-        os.makedirs(self.out_dir)
+        if self.out_dir:
+            os.makedirs(self.out_dir)
 
     def get_tile_dim(self):
         """Returns dimension usable for tiling & parallelisation of recipe execution.
@@ -143,16 +154,16 @@ class TileHandler:
 
         elif self.tile_dim == sq.dimensions.SPACE:
             # create spatial grid
-            if self.merge == "vrt":
-                precise = False
+            if self.merge == "vrt" or self.merge is None:
+                precise_shp = False
             else:
-                precise = True
+                precise_shp = True
             self.grid = self.create_spatial_grid(
                 self.space,
                 self.spatial_resolution,
                 self.chunksize_s,
                 self.crs,
-                precise=precise,
+                precise=precise_shp,
             )
 
     def execute(self):
@@ -170,13 +181,13 @@ class TileHandler:
             )
             _, response = self._execute_workflow(context)
 
-            # handle reponse
-            # note: no response may occur in cases where self.tile_dim==sq.dimensions.TIME
+            # handle missing reponse
+            # possible in cases where self.tile_dim = sq.dimensions.TIME & trim=True
             if response:
                 # write result (in-memory or to disk)
-                if self.merge == "direct":
+                if self.merge == "single":
                     self.tile_results.append(response)
-                elif self.merge == "vrt":
+                elif self.merge == "vrt" or self.merge is None:
                     for layer in response:
                         # write to disk
                         out_dir = os.path.join(self.out_dir, layer)
@@ -187,8 +198,8 @@ class TileHandler:
                         self.tile_results.append(out_path)
 
         # merge results
-        if self.merge == "direct":
-            self.merge_direct()
+        if self.merge == "single":
+            self.merge_single()
         elif self.merge == "vrt":
             self.merge_vrt()
 
@@ -202,9 +213,10 @@ class TileHandler:
             res_dir = os.path.join(self.out_dir, k)
             res_path = os.path.join(self.out_dir, f"{k}.vrt")
             srcs = [os.path.join(res_dir, x) for x in os.listdir(res_dir)]
+            print(srcs)
             virtual_merge(srcs, dst_path=res_path)
 
-    def merge_direct(self):
+    def merge_single(self):
         """Merge results obtained for individual tiles by stitching them
         temporally or spatially depending on the tiling dimension.
         """
@@ -327,18 +339,18 @@ class TileHandler:
         or not.
 
         Works by retrieving the tile size and testing the script for one
-        of the tiles. (to be refined)
+        of the tiles.
         """
         # preliminary checks
         time_info = (
-            "The output_preview function is currently only implemented for "
+            "Estimate_size() is currently only implemented for "
             "spatial outputs. Unless you are processing very dense timeseries "
             "and/or processing many features it's save to assume that the size "
             "of your output is rather small, so don't worry about the memory space.\n"
         )
         space_info = (
             "The following numbers are rough estimations depending on the chosen "
-            "strategy for merging the individual tile results. If merge='direct' "
+            "strategy for merging the individual tile results. If merge='single' "
             "is choosen the numbers indicate a lower bound for how much RAM is required "
             "since the individual tile results will be stored there before merging.\n"
         )
@@ -366,47 +378,97 @@ class TileHandler:
         height = total_bbox[3] - total_bbox[1]
         num_pixels_x = int(np.ceil(width / abs(self.spatial_resolution[0])))
         num_pixels_y = int(np.ceil(height / abs(self.spatial_resolution[1])))
-        total_pixels = num_pixels_x * num_pixels_y
+        xy_pixels = num_pixels_x * num_pixels_y
 
-        first_k = list(response.keys())[0]
-        scale_f1 = total_pixels / response[first_k].size
-        scale_f2 = len(self.grid) * (self.chunksize_s**2) / response[first_k].size
-        merge_dict = {"merge (direct)": scale_f1, "merge (vrt)": scale_f2}
+        # initialise dict to store layer information
+        lyrs_info = {}
+        for layer, arr in response.items():
+            # compile general layer information
+            lyr_info = {}
+            lyr_info["dtype"] = arr.dtype
+            lyr_info["res"] = self.spatial_resolution
+            lyr_info["crs"] = self.crs
+            # get array sizes (spatially & others)
+            xy_dims = [sq.dimensions.X, sq.dimensions.Y]
+            arr_xy_dims = [x for x in arr.dims if x in xy_dims]
+            arr_z_dims = [x for x in arr.dims if x not in xy_dims]
+            arr_xy = arr.isel(**{dim: 0 for dim in arr_z_dims})
+            arr_z = arr.isel(**{dim: 0 for dim in arr_xy_dims})
+            # extrapolate layer information for different merging strategies
+            lyr_info["merge"] = {}
+            # a) merge into single array
+            scale = xy_pixels / arr_xy.size
+            lyr_info["merge"]["single"] = {}
+            lyr_info["merge"]["single"]["strategies"] = ["single"]
+            lyr_info["merge"]["single"]["n"] = 1
+            lyr_info["merge"]["single"]["size"] = scale * arr.nbytes / (1024**3)
+            lyr_info["merge"]["single"]["shape"] = (
+                *arr_z.shape,
+                num_pixels_x,
+                num_pixels_y,
+            )
+            # b) vrt or no merge
+            scale = len(self.grid) * (self.chunksize_s**2) / arr_xy.size
+            lyr_info["merge"]["multiple"] = {}
+            lyr_info["merge"]["multiple"]["strategies"] = ["vrt", None]
+            lyr_info["merge"]["multiple"]["n"] = len(self.grid)
+            lyr_info["merge"]["multiple"]["size"] = scale * arr.nbytes / (1024**3)
+            lyr_info["merge"]["multiple"]["shape"] = (
+                *arr_z.shape,
+                self.chunksize_s,
+                self.chunksize_s,
+            )
+            lyrs_info[layer] = lyr_info
 
-        # return scaled numbers for each response
-        max_length = max(len(r) for r in response) + 1
-        print("----------------------------------------")
+        # print general layer information
+        max_l_lyr = max(len(r) for r in lyrs_info.keys())
+
+        # part a) general information
+        max_l_res = max([len(str(info["res"])) for lyr, info in lyrs_info.items()])
+        line_l = max_l_lyr + max_l_res + 19
+        print(line_l * "-")
         print("General layer info")
-        print("----------------------------------------")
-        for layer in response:
-            dtype = response[layer].dtype
-            print(f"{layer:<{max_length}}: {dtype}")
+        print(line_l * "-")
+        print(f"{'layer':{max_l_lyr}} : {'dtype':{9}} {'crs':{5}} {'res':{max_l_res}}")
+        print(line_l * "-")
+        for lyr, info in lyrs_info.items():
+            print(
+                f"{lyr:{max_l_lyr}} : {str(info['dtype']):{9}} {str(info['crs']):{5}} {str(info['res']):{max_l_res}}"
+            )
+        print(line_l * "-")
         print("")
 
-        for k, s in merge_dict.items():
-            max_length = max(len(lyr) for lyr in response)
-            max_length = max(max_length, len("Total size")) + 3
-            total_size = sum((s * response[lyr].nbytes / (1024**3)) for lyr in response)
-            print("----------------------------------------")
-            print(f"Scenario: {k}")
-            print("----------------------------------------")
-            print(f"{'Total size':<{max_length}}: {total_size:.2f} Gb")
-            for layer in response:
-                size_gb = s * response[layer].nbytes / (1024**3)
-                print(f"* {layer:<{max_length - 2}}: {size_gb:.2f} Gb")
-            print("")
-            if k == "merge (direct)":
-                shape = f"({num_pixels_x}, {num_pixels_y})"
-                n_tiles = 1
-            elif k == "merge (vrt)":
-                shape = f"({self.chunksize_s}, {self.chunksize_s})"
-                n_tiles = len(self.grid)
-            resolution = self.spatial_resolution
-            crs = self.crs
-            print(f"{'number of tiles':<{16}}: {n_tiles}")
-            print(f"{'shape':<{16}}: {shape}")
-            print(f"{'resolution':<{16}}: {resolution}")
-            print(f"{'crs':<{16}}: {crs}")
+        # part b) merge strategy dependend information
+        for merge in lyrs_info[list(lyrs_info.keys())[0]]["merge"].keys():
+            mtypes = lyrs_info[list(lyrs_info.keys())[0]]["merge"][merge]["strategies"]
+            total_n = sum([info["merge"][merge]["n"] for info in lyrs_info.values()])
+            total_size = sum(
+                [info["merge"][merge]["size"] for info in lyrs_info.values()]
+            )
+            max_shape = max(
+                [info["merge"][merge]["shape"] for info in lyrs_info.values()]
+            )
+            max_l_n = len(f"{total_n}")
+            max_l_size = len(f"{total_size:.2f}")
+            max_l_shape = len(str(max_shape))
+            line_l = max_l_lyr + max_l_n + max_l_size + max_l_shape + 18
+            print(line_l * "-")
+            print(f"Scenario: 'merge' = {' or '.join([str(x) for x in mtypes])}")
+            print(line_l * "-")
+            print(
+                f"{'layer':{max_l_lyr}} : {'size':^{max_l_size+3}}  {'tile n':^{max_l_n+8}}  {'tile shape':^{max_l_shape}}"
+            )
+            print(line_l * "-")
+            for lyr, info in lyrs_info.items():
+                lyr_info = info["merge"][merge]
+                print(
+                    f"{lyr:{max_l_lyr}} : {lyr_info['size']:>{max_l_size}.2f} Gb  {lyr_info['n']:>{max_l_n}} tile(s)  {str(lyr_info['shape']):>{max_l_shape}}"
+                )
+            print(line_l * "-")
+            print(
+                f"{'Total':{max_l_lyr}}   {total_size:{max_l_size}.2f} Gb  {total_n:{max_l_n}} tile(s)"
+            )
+            print(line_l * "-")
             print("")
 
     def _create_context(self, **kwargs):
