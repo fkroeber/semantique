@@ -656,9 +656,11 @@ class TileHandlerParallel(TileHandler):
             # run individual processes in parallelised manner
             with Pool(processes=self.n_procs) as pool:
                 func = lambda idx: self._execute_tile(idx, shared_self)
-                self.tile_results = list(
+                tile_results = list(
                     tqdm(pool.imap(func, grid_idxs), total=len(grid_idxs))
                 )
+        # flatten results
+        self.tile_results = [x for sl in tile_results for x in sl]
         # merge results
         if self.merge == "single":
             self.merge_single()
@@ -684,8 +686,9 @@ class TileHandlerParallel(TileHandler):
         if response:
             # write result (in-memory or to disk)
             if th.merge == "single":
-                return response
+                out = list(response)
             elif th.merge == "vrt" or th.merge is None:
+                out = []
                 for layer in response:
                     # write to disk
                     out_dir = os.path.join(th.out_dir, layer)
@@ -693,4 +696,5 @@ class TileHandlerParallel(TileHandler):
                     os.makedirs(out_dir, exist_ok=True)
                     layer = response[layer].rio.write_crs(th.crs)
                     layer.rio.to_raster(out_path)
-                    return out_path
+                    out.append(out_path)
+            return out
