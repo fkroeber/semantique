@@ -1,3 +1,9 @@
+"""
+Tbd
+* add logger for debugging
+* introduce redundancy in case of failure
+"""
+
 import numpy as np
 import os
 import geopandas as gpd
@@ -7,13 +13,13 @@ import xarray as xr
 
 from copy import deepcopy
 from itertools import product
-from multiprocess import Pool
+from multiprocess import Pool, Manager
 from rioxarray.merge import merge_arrays
 from shapely.geometry import box
 from tqdm import tqdm
-from tqdm.contrib.concurrent import process_map
 
 import semantique as sq
+from semantique import exceptions
 from semantique.extent import SpatialExtent, TemporalExtent
 from semantique.processor.arrays import Collection
 from semantique.processor.core import QueryProcessor
@@ -170,7 +176,19 @@ class TileHandler:
         """Runs the QueryProcessor.execute() method for all tiles."""
         # dry-run is required
         # read cache and write to object to read from for all subsequent calls
-        self.estimate_size()
+        if self.tile_dim == sq.dimensions.TIME:
+            self.get_tile_grid()
+            # preview run of workflow for a single tile
+            tile = self.grid[0]
+            context = self._create_context(
+                **{self.tile_dim: tile}, preview=True, cache=None
+            )
+            qp, response = TileHandler._execute_workflow(context)
+            # init cache
+            if self.caching:
+                self.cache = qp.cache
+        elif self.tile_dim == sq.dimensions.SPACE:
+            self.estimate_size()
 
         for i, tile in tqdm(
             enumerate(self.grid), disable=not self.verbose, total=len(self.grid)
@@ -179,7 +197,7 @@ class TileHandler:
             context = self._create_context(
                 **{self.tile_dim: tile}, cache=deepcopy(self.cache)
             )
-            _, response = self._execute_workflow(context)
+            _, response = TileHandler._execute_workflow(context)
 
             # handle missing reponse
             # possible in cases where self.tile_dim = sq.dimensions.TIME & trim=True
@@ -211,9 +229,8 @@ class TileHandler:
         res_keys = [os.path.dirname(x).split(os.sep)[-1] for x in self.tile_results]
         for k in np.unique(res_keys):
             res_dir = os.path.join(self.out_dir, k)
-            res_path = os.path.join(self.out_dir, f"{k}.vrt")
             srcs = [os.path.join(res_dir, x) for x in os.listdir(res_dir)]
-            print(srcs)
+            res_path = os.path.join(self.out_dir, f"{k}.vrt")
             virtual_merge(srcs, dst_path=res_path)
 
     def merge_single(self):
@@ -242,7 +259,9 @@ class TileHandler:
                     joint_arr.name = k
                     joint_res[k] = joint_arr
                 else:
-                    raise ValueError("Not implemented.")
+                    raise NotImplementedError(
+                        f"No method for merging source array {src_arr}."
+                    )
             # if spatial result
             elif self.tile_dim == sq.dimensions.SPACE:
                 # get dimensions of input array
@@ -306,6 +325,11 @@ class TileHandler:
                         arrs_main.append(new_arr)
                     # merge across time
                     joint_arr = xr.concat(arrs_main, dim=time_dim)
+                    # persist band names
+                    joint_arr.attrs["long_name"] = [
+                        str(x) for x in joint_arr[time_dim].values
+                    ]
+                    joint_arr.attrs["band_variable"] = time_dim
                 else:
                     # direct spatial merge possible
                     arrs = []
@@ -331,8 +355,12 @@ class TileHandler:
         # write to out_dir
         if self.out_dir:
             for k, v in self.joint_res.items():
-                out_path = os.path.join(self.out_dir, f"{k}.tif")
-                self.joint_res[k].rio.to_raster(out_path)
+                if self.tile_dim == sq.dimensions.TIME:
+                    out_path = os.path.join(self.out_dir, f"{k}.nc")
+                    v.to_netcdf(out_path)
+                elif self.tile_dim == sq.dimensions.SPACE:
+                    out_path = os.path.join(self.out_dir, f"{k}.tif")
+                    v.rio.to_raster(out_path)
 
     def estimate_size(self):
         """Estimator to see if results can be given as one final object
@@ -366,7 +394,7 @@ class TileHandler:
         context = self._create_context(
             **{self.tile_dim: tile}, preview=True, cache=None
         )
-        qp, response = self._execute_workflow(context)
+        qp, response = TileHandler._execute_workflow(context)
 
         # init cache
         if self.caching:
@@ -474,6 +502,7 @@ class TileHandler:
     def _create_context(self, **kwargs):
         """Create execution context with dynamic space/time."""
         context = {
+            "recipe": self.recipe,
             "datacube": self.datacube,
             "space": self.space,
             "time": self.time,
@@ -484,14 +513,18 @@ class TileHandler:
         context.update(kwargs)
         return context
 
-    def _execute_workflow(self, context):
+    @staticmethod
+    def _execute_workflow(context):
         """Execute the workflow and handle response."""
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            # response = self.recipe.execute(**context)
-            qp = QueryProcessor.parse(self.recipe, **context)
-            response = qp.optimize().execute()
-            return qp, response
+            try:
+                qp = QueryProcessor.parse(**context)
+                response = qp.optimize().execute()
+                return qp, response
+            except exceptions.EmptyDataError as e:
+                warnings.warn(e)
+                return None, None
 
     @staticmethod
     def get_op_dims(recipe_piece, dims=None):
@@ -594,3 +627,70 @@ class TileHandler:
             ):
                 components[attribute] = getattr(class_obj, attribute)
         return components
+
+
+class TileHandlerParallel(TileHandler):
+    """Handler for executing a query in a tiled manner leveraging multiprocessing.
+    The heavyweight and repetitive initialisation via estimate_size() is carried out once and
+    then tiles are processed in parallel.
+
+    Note that for STACCubes, parallel processing is per default already enabled for data loading. Parallel processing via TileHandlerParallel therefore only makes sense if the workflow encapsulated in the recipe is significantly more time-consuming than the actual data loading. It must also be noted that the available RAM resources must be sufficient to process, n_procs times the amount of data that arises in the case of a simple TileHandler. This usually requires an adjustment of the chunksizes, which in turn may increase the amount of redundant data fetching processes (because the same data may be loaded for neighbouring smaller tiles). The possible advantage of using the ParallelProcessor therefore depends on the specific recipe and is not trivial. In case of doubt, the use of the TileHandler without multiprocessing is recommended.
+
+    Note that custom functions (verb, operators, reducers) need to be defined in a self-contained way,
+    i.e. including imports such as `import semantique as sq` at their beginning since the
+    multiprocessing environment isolates the main process from the worker processes and the function is not serializable.
+    """
+
+    def __init__(self, *args, n_procs=os.cpu_count(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n_procs = n_procs
+        self.estimate_size()
+
+    def execute(self):
+        # get grid idxs
+        grid_idxs = np.arange(len(self.grid))
+        # use manager to create a proxy for self that can be shared across processes
+        with Manager() as manager:
+            shared_self = manager.dict()
+            shared_self.update({"instance": self})
+            # run individual processes in parallelised manner
+            with Pool(processes=self.n_procs) as pool:
+                func = lambda idx: self._execute_tile(idx, shared_self)
+                self.tile_results = list(
+                    tqdm(pool.imap(func, grid_idxs), total=len(grid_idxs))
+                )
+        # merge results
+        if self.merge == "single":
+            self.merge_single()
+        elif self.merge == "vrt":
+            self.merge_vrt()
+
+    def _execute_tile(self, tile_idx, shared_self):
+        # get shared instance
+        th = shared_self["instance"]
+        # set data loading to single processes
+        dc = th.datacube
+        dc.config["dask_params"] = {"scheduler": "single-threaded"}
+        # create context for specific tile
+        context_params = {
+            **{th.tile_dim: th.grid[tile_idx]},
+            "cache": th.cache,
+            "datacube": dc,
+        }
+        context = th._create_context(**context_params)
+        # evaluate the recipe
+        _, response = th._execute_workflow(context)
+        # handle response
+        if response:
+            # write result (in-memory or to disk)
+            if th.merge == "single":
+                return response
+            elif th.merge == "vrt" or th.merge is None:
+                for layer in response:
+                    # write to disk
+                    out_dir = os.path.join(th.out_dir, layer)
+                    out_path = os.path.join(out_dir, f"{tile_idx}.tif")
+                    os.makedirs(out_dir, exist_ok=True)
+                    layer = response[layer].rio.write_crs(th.crs)
+                    layer.rio.to_raster(out_path)
+                    return out_path
