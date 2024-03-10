@@ -14,10 +14,11 @@ import rioxarray
 import stackstac
 import warnings
 
-from datacube.utils import masking
 from abc import abstractmethod
+from datacube.utils import masking
+from pystac_client.stac_api_io import StacApiIO
+from urllib3 import Retry
 
-from rasterio.errors import RasterioIOError
 from semantique import exceptions
 from semantique.dimensions import TIME, SPACE, X, Y
 from semantique.exceptions import EmptyDataError
@@ -911,7 +912,7 @@ class STACCube(Datacube):
         resampler_func = getattr(rasterio.enums.Resampling, resampler_name)
 
         # actual data loading, i.e. fetch data from links in STAC results
-        retry, max_retries = 0, 1
+        retry, max_retries = 0, 3
         while retry <= max_retries:
             # subset temporally
             times = [
@@ -1056,7 +1057,17 @@ class STACCube(Datacube):
         for coll in curr_colls.keys():
             if coll in auth_colls.keys():
                 # perform search again to renew authentification
-                client = pystac_client.Client.open(coll, modifier=auth_colls[coll])
+                retry = Retry(
+                    total=5,
+                    backoff_factor=1,
+                    status_forcelist=[408, 502, 503, 504],
+                    allowed_methods=None,
+                )
+                client = pystac_client.Client.open(
+                    coll,
+                    modifier=auth_colls[coll],
+                    stac_io=StacApiIO(max_retries=retry),
+                )
                 item_search = client.search(ids=curr_colls[coll]["ids"])
                 updated_items.extend(list(item_search.items()))
             else:
