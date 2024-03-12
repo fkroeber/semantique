@@ -989,12 +989,12 @@ class STACCube(Datacube):
         # retrieve dtype
         try:
             lyr_dtype = np.dtype(metadata["dtype"])
-        except TypeError:
+        except:
             lyr_dtype = "float32"
         # retrieve na_value
         try:
             lyr_na = np.array([metadata["na_value"]], dtype=lyr_dtype)[0]
-        except ValueError:
+        except:
             if isinstance(np.array([1], dtype=lyr_dtype)[0], np.floating):
                 lyr_na = np.nan
             else:
