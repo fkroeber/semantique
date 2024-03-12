@@ -17,6 +17,7 @@ import warnings
 from abc import abstractmethod
 from datacube.utils import masking
 from pystac_client.stac_api_io import StacApiIO
+from rasterio.errors import RasterioIOError
 from urllib3 import Retry
 
 from semantique import exceptions
@@ -706,13 +707,6 @@ class STACCube(Datacube):
           resampled to the day level, using solar day to keep scenes together?
           Defaults to :obj:`True`.
 
-        * **dtype** (:obj:`str`): Dtype of the data source. Will be converted to
-        float32/float64 prior to passing it to the semantique processor.
-        Defaults to :obj:`float32`.
-
-        * **na_value** (:obj:`int`): NA value as encoded in the original data
-        Defaults to :obj:`np.nan`.
-
         * **dask_params** (:obj:`dict`): Parameters passed to the .compute() function
         when fetching data via the stackstac API. Can be used to control the parallelism
         in fetching data. Defaults to :obj:`None`, i.e. to use the threaded scheduler as
@@ -778,8 +772,6 @@ class STACCube(Datacube):
         return {
             "trim": True,
             "group_by_solar_day": True,
-            "dtype": "float32",
-            "na_value": np.nan,
             "dask_params": None,
             "value_type_mapping": {
                 "nominal": "nominal",
@@ -878,7 +870,7 @@ class STACCube(Datacube):
         # Format loaded data.
         data = self._format(data, metadata, extent)
         # Mask invalid data.
-        data = self._mask(data)
+        data = self._mask(data, metadata)
         if data.sq.is_empty:
             warnings.warn(
                 f"All values for data layer '{reference}' are invalid within the "
@@ -911,6 +903,9 @@ class STACCube(Datacube):
         resampler_name = self.config["resamplers"][metadata["type"]]
         resampler_func = getattr(rasterio.enums.Resampling, resampler_name)
 
+        # retrieve layer specific information
+        lyr_dtype, lyr_na = self._get_dtype_na(metadata)
+
         # actual data loading, i.e. fetch data from links in STAC results
         retry, max_retries = 0, 3
         while retry <= max_retries:
@@ -930,17 +925,23 @@ class STACCube(Datacube):
                     bounds=s_bounds,
                     epsg=epsg,
                     resolution=res,
-                    fill_value=self.config["na_value"],
-                    dtype=self.config["dtype"],
+                    fill_value=lyr_na,
+                    dtype=lyr_dtype,
                     rescale=False,  # to allow reading as provided int type
-                    # errors_as_nodata=(
-                    #     RasterioIOError(".*"),
-                    # ),  # to skip wrongly formatted files (Landsat)
+                    errors_as_nodata=(
+                        RasterioIOError(".*"),
+                    ),  # to skip wrongly formatted files (Landsat)
                     xy_coords="center",
                     snap_bounds=False,
                 )
                 data = data.compute(**(self.config["dask_params"] or {}))
                 break
+
+            # restrict rasterioerrors (not auth erros), set navalue, discard stackstac stuff
+            # test assess via Landsat scenes & Sentinel (git docs)
+            # see if pre-evaluation can be omitted (iteration after pystac client search)
+            # Read or write failed. IReadBlock failed at X offset 6, Y offset 21: TIFFReadEncodedTile() failed
+            # not recognized as a supported file format.
 
             # re-authenticate data access
             except Exception as e:
@@ -970,19 +971,36 @@ class STACCube(Datacube):
             if len(data.time):
                 days = data.time.astype("datetime64[ns]").dt.floor("D")
                 if data.dtype.kind == "f":
-                    data = data.where(data != self.config["na_value"])
+                    data = data.where(data != lyr_na)
                     data = (
                         data.groupby(days).first(skipna=True).rename({"floor": "time"})
                     )
                 else:
                     data = (
                         data.groupby(days)
-                        .reduce(_mosaic_ints, na_value=self.config["na_value"])
+                        .reduce(_mosaic_ints, na_value=lyr_na)
                         .rename({"floor": "time"})
                     )
                 data["time"] = data.time.values
 
         return data
+
+    def _get_dtype_na(self, metadata):
+        # retrieve dtype
+        try:
+            lyr_dtype = np.dtype(metadata["dtype"])
+        except TypeError:
+            lyr_dtype = "float32"
+        # retrieve na_value
+        try:
+            lyr_na = np.array([metadata["na_value"]], dtype=lyr_dtype)[0]
+        except ValueError:
+            if isinstance(np.array([1], dtype=lyr_dtype)[0], np.floating):
+                lyr_na = np.nan
+            else:
+                lyr_na = 0
+        # return both
+        return lyr_dtype, lyr_na
 
     def _format(self, data, metadata, extent):
         # Step I: Set band as array name.
@@ -1025,9 +1043,10 @@ class STACCube(Datacube):
         data["spatial_feats"].sq.value_labels = extent["spatial_feats"].sq.value_labels
         return data
 
-    def _mask(self, data):
+    def _mask(self, data, metadata):
         # Step I: Mask nodata values.
-        data = data.where(data != self.config["na_value"])
+        _, lyr_na = self._get_dtype_na(metadata)
+        data = data.where(data != lyr_na)
         data = data.where(data != data.rio.nodata)
         # Step II: Mask values outside of the spatial extent.
         # This is needed since data are initially loaded for the bbox of the extent.
