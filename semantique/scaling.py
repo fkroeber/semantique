@@ -8,6 +8,7 @@ import numpy as np
 import os
 import geopandas as gpd
 import pandas as pd
+import threading
 import warnings
 import xarray as xr
 
@@ -28,7 +29,7 @@ from semantique.vrt import virtual_merge
 
 class TileHandler:
     """Handler for executing a query in a (spatially or temporally) tiled manner.
-    Currently only supports non-grouped outputs (at least spatially).
+    Currently only supports non-grouped outputs.
 
     Parameters
     ----------
@@ -36,16 +37,39 @@ class TileHandler:
         The query recipe to be processed.
       datacube : Datacube
         The datacube instance to process the query against.
-      space : tbd
-      time : tbd
-      chunksize_t : tbd
-      chunksize_s : tbd
-      merge : one of ["vrt", "single", None], see Notes
+      space : SpatialExtent
+        The spatial extent in which the query should be processed.
+      time : TemporalExtent
+        The temporal extent in which the query should be processed.
+      spatial_resolution : :obj:`list`
+        Spatial resolution of the grid. Should be given as a list in the format
+        `[y, x]`, where y is the cell size along the y-axis, x is the cell size
+        along the x-axis, and both are given as :obj:`int` or :obj:`float`
+        value expressed in the units of the CRS. These values should include
+        the direction of the axes. For most CRSs, the y-axis has a negative
+        direction, and hence the cell size along the y-axis is given as a
+        negative number.
+      crs : optional
+        Coordinate reference system in which the grid should be created. Can be
+        given as any object understood by the initializer of
+        :class:`pyproj.crs.CRS`. This includes :obj:`pyproj.crs.CRS` objects
+        themselves, as well as EPSG codes and WKT strings. If :obj:`None`, the
+        CRS of the extent itself is used.
+      chunksize_t : int, tbd
+        Temporal chunksize
+      chunksize_s : int, tbd
+        Spatial chunksize
+      tile_dim : tbd
+      merge : one of ["vrt", "single", None]
+      out_dir : str
+      caching : bool
+      verbose : bool
       **config :
         Additional configuration parameters forwarded to QueryRecipe.execute.
         See :class:`QueryRecipe`, respectively :class:`QueryProcessor`.
-
-    Notes: "vrt" requires recipe to not use trim and
+        Needs to contain at least mapping instance to process the query against.
+        (tbd: exclude mapping as obligatory parameter such that only optional
+        parameters need to be placed here)
     """
 
     def __init__(
@@ -111,6 +135,10 @@ class TileHandler:
         # create output directory
         if self.out_dir:
             os.makedirs(self.out_dir)
+        # start re-auth
+        thread = threading.Thread(target=self.datacube._sign_metadata)
+        thread.daemon = True
+        thread.start()
 
     def get_tile_dim(self):
         """Returns dimension usable for tiling & parallelisation of recipe execution.
