@@ -20,6 +20,7 @@ from datacube.utils import masking
 from datetime import datetime
 from pystac_client.stac_api_io import StacApiIO
 from rasterio.errors import RasterioIOError
+from tqdm import tqdm
 from urllib3 import Retry
 
 from semantique import exceptions
@@ -1078,48 +1079,52 @@ class STACCube(Datacube):
         data = data.where(data["spatial_feats"].notnull())
         return data
 
-    def _sign_metadata(self, refresh_time=1800):
-        while True:
-            print(f"{datetime.now().strftime('%H%M%S')} - start signing")
-            # retrieve collections root & item ids
-            items = list(self.src)
-            item_ids = [x.id for x in items]
-            roots = [x.get_root_link().href for x in items]
-            # create dictionary grouped by collection
-            curr_colls = {}
-            for c, id, item in zip(roots, item_ids, items):
-                if c not in curr_colls:
-                    curr_colls[c] = {"ids": [], "items": []}
-                curr_colls[c]["ids"].append(id)
-                curr_colls[c]["items"].append(item)
-            # define collections requiring authentication
-            # dict with collection and modifier
-            auth_colls = {}
-            auth_colls = {
-                "https://planetarycomputer.microsoft.com/api/stac/v1": pc.sign_inplace
-            }
-            # update signature for items
-            updated_items = []
-            for coll in curr_colls.keys():
-                if coll in auth_colls.keys():
-                    # perform search again to renew authentification
-                    retry = Retry(
-                        total=5,
-                        backoff_factor=1,
-                        status_forcelist=[408, 502, 503, 504],
-                        allowed_methods=None,
-                    )
+    def _sign_metadata(self):
+        # retrieve collections root & item ids
+        items = list(self.src)
+        roots = [x.get_root_link().href for x in items]
+        # create dictionary grouped by collection
+        curr_colls = {}
+        for c, item in zip(roots, items):
+            if c not in curr_colls:
+                curr_colls[c] = {"items": []}
+            curr_colls[c]["items"].append(item)
+        # define collections requiring authentication
+        # dict with collection and modifier
+        auth_colls = {}
+        auth_colls = {
+            "https://planetarycomputer.microsoft.com/api/stac/v1": pc.sign_inplace
+        }
+        # update signature for items
+        updated_items = []
+        for coll in curr_colls.keys():
+            if coll in auth_colls.keys():
+                # perform search again to renew authentification
+                retry = Retry(
+                    total=5,
+                    backoff_factor=1,
+                    status_forcelist=[408, 502, 503, 504],
+                    allowed_methods=None,
+                )
+                item_chunks = STACCube._divide_chunks(curr_colls[coll]["items"], 100)
+                for chunk in item_chunks:
                     client = pystac_client.Client.open(
                         coll,
                         modifier=auth_colls[coll],
-                        stac_io=StacApiIO(max_retries=retry),
+                        stac_io=StacApiIO(max_retries=retry, timeout=1800),
                     )
-                    item_search = client.search(ids=curr_colls[coll]["ids"])
+                    item_search = client.search(
+                        ids=[x.id for x in chunk],
+                        collections=[x.get_collection() for x in chunk],
+                    )
                     updated_items.extend(list(item_search.items()))
-                else:
-                    updated_items.extend(curr_colls[coll]["items"])
-            # return signed items
-            updated_coll = pystac.ItemCollection(updated_items)
-            self.src = updated_coll
-            print(f"{datetime.now().strftime('%H%M%S')} - end signing")
-            time.sleep(refresh_time)
+            else:
+                updated_items.extend(curr_colls[coll]["items"])
+        # return signed items
+        updated_coll = pystac.ItemCollection(updated_items)
+        self.src = updated_coll
+        print(f"{datetime.now().strftime('%H%M%S')} - end signing\n")
+
+    @staticmethod
+    def _divide_chunks(lst, k):
+        return [lst[i : i + k] for i in range(0, len(lst), k)]

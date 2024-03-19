@@ -8,6 +8,7 @@ import numpy as np
 import os
 import geopandas as gpd
 import pandas as pd
+import time
 import threading
 import warnings
 import xarray as xr
@@ -135,10 +136,22 @@ class TileHandler:
         # create output directory
         if self.out_dir:
             os.makedirs(self.out_dir)
-        # start re-auth
-        thread = threading.Thread(target=self.datacube._sign_metadata)
-        thread.daemon = True
-        thread.start()
+        # continous re-auth every 30 seconds
+        self.signing_thread_event = threading.Event()
+        self.signing_thread = threading.Thread(target=self.continuous_signing)
+        self.signing_thread.daemon = True
+        self.signing_thread.start()
+
+    def continuous_signing(self, interval=30):
+        while not self.signing_thread_event.is_set():
+            thread = threading.Thread(target=self.datacube._sign_metadata)
+            thread.daemon = True
+            thread.start()
+            time.sleep(interval)
+
+    def __del__(self):
+        self.signing_thread_event.set()
+        self.signing_thread.join(timeout=5)
 
     def get_tile_dim(self):
         """Returns dimension usable for tiling & parallelisation of recipe execution.
