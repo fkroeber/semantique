@@ -911,6 +911,11 @@ class STACCube(Datacube):
         keep = (times >= t_bounds[0]) & (times < t_bounds[1])
         item_coll = [x for x, k in zip(self.src, keep) if k]
 
+        # return extent array as NaN in case of no data
+        if not len(item_coll):
+            empty_arr = xr.full_like(extent, np.NaN)
+            return empty_arr
+
         data = stackstac.stack(
             item_coll,
             assets=[metadata["name"]],
