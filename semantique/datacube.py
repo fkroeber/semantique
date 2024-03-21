@@ -933,54 +933,6 @@ class STACCube(Datacube):
         )
         data = data.compute(**(self.config["dask_params"] or {}))
 
-        # # actual data loading, i.e. fetch data from links in STAC results
-        # retry, max_retries = 0, 3
-        # while retry <= max_retries:
-        #     # subset temporally
-        #     times = [
-        #         np.datetime64(x.get_datetime().replace(tzinfo=None)) for x in self.src
-        #     ]
-        #     t_bounds = extent.sq.tz_convert(self.tz).time.values
-        #     keep = (times >= t_bounds[0]) & (times < t_bounds[1])
-        #     item_coll = [x for x, k in zip(self.src, keep) if k]
-
-        #     try:
-        #         data = stackstac.stack(
-        #             item_coll,
-        #             assets=[metadata["name"]],
-        #             resampling=resampler_func,
-        #             bounds=s_bounds,
-        #             epsg=epsg,
-        #             resolution=res,
-        #             fill_value=lyr_na,
-        #             dtype=lyr_dtype,
-        #             rescale=False,  # to allow reading as provided int type
-        #             errors_as_nodata=(
-        #                 RasterioIOError(".*"),
-        #             ),  # to skip wrongly formatted files (Landsat)
-        #             xy_coords="center",
-        #             snap_bounds=False,
-        #         )
-        #         data = data.compute(**(self.config["dask_params"] or {}))
-        #         break
-
-        #     # currently any RasterioError is converted to NA values
-        #     # problem - restricting error types & isolation to auth errors not feasible since same error
-        #     # a) Read or write failed. IReadBlock failed at X offset 6, Y offset 21: TIFFReadEncodedTile() failed
-        #     # b) not recognized as a supported file format.
-
-        #     # re-authenticate data access
-        #     except Exception as e:
-        #         # Specific check for "No items" ValueError
-        #         if isinstance(e, ValueError) and str(e) == "No items":
-        #             raise EmptyDataError
-        #         else:
-        #             if retry == 0:
-        #                 self.src = self._sign_metadata(self.src)
-        #             retry += 1
-        #             if retry > max_retries:
-        #                 raise
-
         # mosaicking in case of temporal grouping
         # convert datetimes to daily granularity - resample by day
         def _mosaic_ints(x, axis=0, na_value=np.nan):
