@@ -64,6 +64,7 @@ class TileHandler:
       merge : one of ["vrt", "single", None]
       out_dir : str
       caching : bool
+      resign : bool
       verbose : bool
       **config :
         Additional configuration parameters forwarded to QueryRecipe.execute.
@@ -87,6 +88,7 @@ class TileHandler:
         merge="single",
         out_dir=None,
         caching=False,
+        reauth=True,
         verbose=False,
         **config,
     ):
@@ -102,6 +104,7 @@ class TileHandler:
         self.merge = merge
         self.out_dir = out_dir
         self.caching = caching
+        self.reauth = reauth
         self.verbose = verbose
         self.config = config
         self.setup()
@@ -137,10 +140,11 @@ class TileHandler:
         if self.out_dir:
             os.makedirs(self.out_dir)
         # continous re-auth every 30 seconds
-        self.signing_thread_event = threading.Event()
-        self.signing_thread = threading.Thread(target=self.continuous_signing)
-        self.signing_thread.daemon = True
-        self.signing_thread.start()
+        if self.reauth:
+            self.signing_thread_event = threading.Event()
+            self.signing_thread = threading.Thread(target=self.continuous_signing)
+            self.signing_thread.daemon = True
+            self.signing_thread.start()
 
     def continuous_signing(self, interval=30):
         while not self.signing_thread_event.is_set():
@@ -149,9 +153,10 @@ class TileHandler:
             thread.start()
             time.sleep(interval)
 
-    def __del__(self):
-        self.signing_thread_event.set()
-        self.signing_thread.join(timeout=5)
+    # join thread when deleting the instance - not working yet
+    # def __del__(self):
+    #     self.signing_thread_event.set()
+    #     self.signing_thread.join(timeout=5)
 
     def get_tile_dim(self):
         """Returns dimension usable for tiling & parallelisation of recipe execution.
@@ -677,15 +682,17 @@ class TileHandlerParallel(TileHandler):
 
     Note that for STACCubes, parallel processing is per default already enabled for data loading. Parallel processing via TileHandlerParallel therefore only makes sense if the workflow encapsulated in the recipe is significantly more time-consuming than the actual data loading. It must also be noted that the available RAM resources must be sufficient to process, n_procs times the amount of data that arises in the case of a simple TileHandler. This usually requires an adjustment of the chunksizes, which in turn may increase the amount of redundant data fetching processes (because the same data may be loaded for neighbouring smaller tiles). The possible advantage of using the ParallelProcessor therefore depends on the specific recipe and is not trivial. In case of doubt, the use of the TileHandler without multiprocessing is recommended.
 
-    Note that custom functions (verb, operators, reducers) need to be defined in a self-contained way,
-    i.e. including imports such as `import semantique as sq` at their beginning since the
-    multiprocessing environment isolates the main process from the worker processes and the function is not serializable.
+    Note that the multiprocessing environment isolates the main process from the worker processes and ressources need to be serializable to be shared among worker processes. This implies that:
+    A) Custom functions (verb, operators, reducers) need to be defined in a self-contained way, i.e. including imports such as `import semantique as sq` at their beginning.
+    B) Reauth mechanisms relying on threaded processes won't work.
     """
 
     def __init__(self, *args, n_procs=os.cpu_count(), **kwargs):
         super().__init__(*args, **kwargs)
         self.n_procs = n_procs
         self.estimate_size()
+        # threaded reauth is not serializable -> disable
+        self.reauth = False
 
     def execute(self):
         # get grid idxs
