@@ -12,20 +12,16 @@ import pystac_client
 import rasterio
 import rioxarray
 import stackstac
-import time
 import warnings
 
 from abc import abstractmethod
 from datacube.utils import masking
-from datetime import datetime
 from pystac_client.stac_api_io import StacApiIO
 from rasterio.errors import RasterioIOError
-from tqdm import tqdm
 from urllib3 import Retry
 
 from semantique import exceptions
 from semantique.dimensions import TIME, SPACE, X, Y
-from semantique.exceptions import EmptyDataError
 
 
 class Datacube:
@@ -1075,7 +1071,6 @@ class STACCube(Datacube):
         # return signed items
         updated_coll = pystac.ItemCollection(updated_items)
         self.src = updated_coll
-        print(f"{datetime.now().strftime('%H%M%S')} - end signing\n")
 
     @staticmethod
     def _divide_chunks(lst, k):
