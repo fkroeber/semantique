@@ -64,7 +64,7 @@ class TileHandler:
       merge : one of ["vrt", "single", None]
       out_dir : str
       caching : bool
-      resign : bool
+      reauth : bool
       verbose : bool
       **config :
         Additional configuration parameters forwarded to QueryRecipe.execute.
@@ -688,11 +688,11 @@ class TileHandlerParallel(TileHandler):
     """
 
     def __init__(self, *args, n_procs=os.cpu_count(), **kwargs):
+        # threaded reauth is not serializable -> disable
+        kwargs["reauth"] = False
         super().__init__(*args, **kwargs)
         self.n_procs = n_procs
         self.estimate_size()
-        # threaded reauth is not serializable -> disable
-        self.reauth = False
 
     def execute(self):
         # get grid idxs
