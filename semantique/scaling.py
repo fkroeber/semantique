@@ -8,8 +8,12 @@ import numpy as np
 import os
 import geopandas as gpd
 import pandas as pd
+import rioxarray as rxr
+import rasterio as rio
 import time
 import threading
+import shutil
+import uuid
 import warnings
 import xarray as xr
 
@@ -121,12 +125,13 @@ class TileHandler:
         self.get_tile_dim()
         # check merge-dependent prerequisites
         if self.merge == "vrt":
-            warnings.warn(
-                "merge == vrt requires all outputs to have the same shape. "
-                "Ensure that the recipe does not contain any trim operations. "
-                "The datacube configuration will be set to trim=False."
-            )
-            self.datacube.config["trim"] = False
+            pass
+            # warnings.warn(
+            #     "merge == vrt requires all outputs to have the same shape. "
+            #     "Ensure that the recipe does not contain any trim operations. "
+            #     "The datacube configuration will be set to trim=False."
+            # )
+            # self.datacube.config["trim"] = False
         elif self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
             raise NotImplementedError(
                 "If tiling is done along the temporal dimension, 'vrt' is "
@@ -220,22 +225,10 @@ class TileHandler:
 
     def execute(self):
         """Runs the QueryProcessor.execute() method for all tiles."""
-        # dry-run is required
-        # read cache and write to object to read from for all subsequent calls
-        if self.tile_dim == sq.dimensions.TIME:
-            self.get_tile_grid()
-            # preview run of workflow for a single tile
-            tile = self.grid[0]
-            context = self._create_context(
-                **{self.tile_dim: tile}, preview=True, cache=None
-            )
-            qp, response = TileHandler._execute_workflow(context)
-            # init cache
-            if self.caching:
-                self.cache = qp.cache
-        elif self.tile_dim == sq.dimensions.SPACE:
-            self.estimate_size()
+        # A) dry-run is performed to set up cache
+        self.preview()
 
+        # B) eval recipe & postprocess in tile-wise manner
         for i, tile in tqdm(
             enumerate(self.grid), disable=not self.verbose, total=len(self.grid)
         ):
@@ -245,23 +238,25 @@ class TileHandler:
             )
             _, response = TileHandler._execute_workflow(context)
 
-            # handle missing reponse
-            # possible in cases where self.tile_dim = sq.dimensions.TIME & trim=True
             if response:
+                # postprocess response
+                response = self._postprocess(response)
                 # write result (in-memory or to disk)
                 if self.merge == "single":
                     self.tile_results.append(response)
                 elif self.merge == "vrt" or self.merge is None:
-                    for layer in response:
+                    for layer in response.keys():
                         # write to disk
                         out_dir = os.path.join(self.out_dir, layer)
                         out_path = os.path.join(out_dir, f"{i}.tif")
                         os.makedirs(out_dir, exist_ok=True)
-                        layer = response[layer].rio.write_crs(self.crs)
-                        layer.rio.to_raster(out_path)
+                        response[layer].rio.to_raster(out_path)
                         self.tile_results.append(out_path)
+            # missing reponse when self.tile_dim = sq.dimensions.TIME & trim=True
+            else:
+                pass
 
-        # merge results
+        # C) optional merge of results
         if self.merge == "single":
             self.merge_single()
         elif self.merge == "vrt":
@@ -276,8 +271,16 @@ class TileHandler:
         for k in np.unique(res_keys):
             res_dir = os.path.join(self.out_dir, k)
             srcs = [os.path.join(res_dir, x) for x in os.listdir(res_dir)]
+            # ensure same bands across tiles
+            self._equalize_bands(srcs)
+            # create virtual raster
             res_path = os.path.join(self.out_dir, f"{k}.vrt")
             virtual_merge(srcs, dst_path=res_path)
+            # create overview for vrt
+            dst = rio.open(res_path, "r+")
+            dst.build_overviews([4, 8, 16, 32, 64, 128, 256, 512])
+            dst.update_tags(ns="rio_overview")
+            dst.close()
 
     def merge_single(self):
         """Merge results obtained for individual tiles by stitching them
@@ -408,16 +411,16 @@ class TileHandler:
                     out_path = os.path.join(self.out_dir, f"{k}.tif")
                     v.rio.to_raster(out_path)
 
-    def estimate_size(self):
+    def preview(self):
         """Estimator to see if results can be given as one final object
         or not.
 
         Works by retrieving the tile size and testing the script for one
         of the tiles.
         """
-        # preliminary checks
+        # preview info
         time_info = (
-            "Estimate_size() is currently only implemented for "
+            "preview() is currently only implemented for "
             "spatial outputs. Unless you are processing very dense timeseries "
             "and/or processing many features it's save to assume that the size "
             "of your output is rather small, so don't worry about the memory space.\n"
@@ -425,13 +428,12 @@ class TileHandler:
         space_info = (
             "The following numbers are rough estimations depending on the chosen "
             "strategy for merging the individual tile results. If merge='single' "
-            "is choosen the numbers indicate a lower bound for how much RAM is required "
-            "since the individual tile results will be stored there before merging.\n"
+            "is choosen the total size indicates a lower bound for how much RAM is "
+            "required since the individual tile results will be stored there before "
+            "merging.\n"
         )
-        if self.tile_dim == sq.dimensions.TIME:
-            raise NotImplementedError(time_info)
-        elif self.tile_dim == sq.dimensions.SPACE:
-            print(space_info)
+
+        # get tiling grid
         if not self.grid:
             self.get_tile_grid()
 
@@ -446,104 +448,125 @@ class TileHandler:
         if self.caching:
             self.cache = qp.cache
 
-        # retrieve amount of pixels for given spatial extent
-        total_bbox = self.space._features.to_crs(self.crs).total_bounds
-        width = total_bbox[2] - total_bbox[0]
-        height = total_bbox[3] - total_bbox[1]
-        num_pixels_x = int(np.ceil(width / abs(self.spatial_resolution[0])))
-        num_pixels_y = int(np.ceil(height / abs(self.spatial_resolution[1])))
-        xy_pixels = num_pixels_x * num_pixels_y
+        # get estimates based on preview run
+        if self.tile_dim == sq.dimensions.TIME:
+            print(time_info)
+        elif self.tile_dim == sq.dimensions.SPACE:
+            print(space_info)
 
-        # initialise dict to store layer information
-        lyrs_info = {}
-        for layer, arr in response.items():
-            # compile general layer information
-            lyr_info = {}
-            lyr_info["dtype"] = arr.dtype
-            lyr_info["res"] = self.spatial_resolution
-            lyr_info["crs"] = self.crs
-            # get array sizes (spatially & others)
-            xy_dims = [sq.dimensions.X, sq.dimensions.Y]
-            arr_xy_dims = [x for x in arr.dims if x in xy_dims]
-            arr_z_dims = [x for x in arr.dims if x not in xy_dims]
-            arr_xy = arr.isel(**{dim: 0 for dim in arr_z_dims})
-            arr_z = arr.isel(**{dim: 0 for dim in arr_xy_dims})
-            # extrapolate layer information for different merging strategies
-            lyr_info["merge"] = {}
-            # a) merge into single array
-            scale = xy_pixels / arr_xy.size
-            lyr_info["merge"]["single"] = {}
-            lyr_info["merge"]["single"]["strategies"] = ["single"]
-            lyr_info["merge"]["single"]["n"] = 1
-            lyr_info["merge"]["single"]["size"] = scale * arr.nbytes / (1024**3)
-            lyr_info["merge"]["single"]["shape"] = (
-                *arr_z.shape,
-                num_pixels_x,
-                num_pixels_y,
-            )
-            # b) vrt or no merge
-            scale = len(self.grid) * (self.chunksize_s**2) / arr_xy.size
-            lyr_info["merge"]["multiple"] = {}
-            lyr_info["merge"]["multiple"]["strategies"] = ["vrt", None]
-            lyr_info["merge"]["multiple"]["n"] = len(self.grid)
-            lyr_info["merge"]["multiple"]["size"] = scale * arr.nbytes / (1024**3)
-            lyr_info["merge"]["multiple"]["shape"] = (
-                *arr_z.shape,
-                self.chunksize_s,
-                self.chunksize_s,
-            )
-            lyrs_info[layer] = lyr_info
+            # retrieve amount of pixels for given spatial extent
+            total_bbox = self.space._features.to_crs(self.crs).total_bounds
+            width = total_bbox[2] - total_bbox[0]
+            height = total_bbox[3] - total_bbox[1]
+            num_pixels_x = int(np.ceil(width / abs(self.spatial_resolution[0])))
+            num_pixels_y = int(np.ceil(height / abs(self.spatial_resolution[1])))
+            xy_pixels = num_pixels_x * num_pixels_y
 
-        # print general layer information
-        max_l_lyr = max(len(r) for r in lyrs_info.keys())
+            # initialise dict to store layer information
+            lyrs_info = {}
+            for layer, arr in response.items():
+                # compile general layer information
+                lyr_info = {}
+                lyr_info["dtype"] = arr.dtype
+                lyr_info["res"] = self.spatial_resolution
+                lyr_info["crs"] = self.crs
+                # get array sizes (spatially & others)
+                xy_dims = [sq.dimensions.X, sq.dimensions.Y]
+                arr_xy_dims = [x for x in arr.dims if x in xy_dims]
+                arr_z_dims = [x for x in arr.dims if x not in xy_dims]
+                arr_xy = arr.isel(**{dim: 0 for dim in arr_z_dims})
+                arr_z = arr.isel(**{dim: 0 for dim in arr_xy_dims})
+                # extrapolate layer information for different merging strategies
+                lyr_info["merge"] = {}
+                # a) merge into single array
+                scale = xy_pixels / arr_xy.size
+                lyr_info["merge"]["single"] = {}
+                lyr_info["merge"]["single"]["n"] = 1
+                lyr_info["merge"]["single"]["size"] = scale * arr.nbytes / (1024**3)
+                lyr_info["merge"]["single"]["shape"] = (
+                    *arr_z.shape,
+                    num_pixels_x,
+                    num_pixels_y,
+                )
+                # b) vrt
+                vrt_scales = [4, 8, 16, 32, 64, 128, 256, 512]
+                size_tiles = lyr_info["merge"]["None"]["size"]
+                size_vrt = sum(
+                    [lyr_info["merge"]["single"]["size"] / (x**2) for x in vrt_scales]
+                )
+                lyr_info["merge"]["vrt"] = {}
+                lyr_info["merge"]["vrt"]["n"] = len(self.grid)
+                lyr_info["merge"]["vrt"]["size"] = size_tiles + size_vrt
+                lyr_info["merge"]["vrt"]["shape"] = (
+                    *arr_z.shape,
+                    self.chunksize_s,
+                    self.chunksize_s,
+                )
+                # c) no merge
+                scale = len(self.grid) * (self.chunksize_s**2) / arr_xy.size
+                lyr_info["merge"]["None"] = {}
+                lyr_info["merge"]["None"]["n"] = len(self.grid)
+                lyr_info["merge"]["None"]["size"] = scale * arr.nbytes / (1024**3)
+                lyr_info["merge"]["None"]["shape"] = (
+                    *arr_z.shape,
+                    self.chunksize_s,
+                    self.chunksize_s,
+                )
+                lyrs_info[layer] = lyr_info
 
-        # part a) general information
-        max_l_res = max([len(str(info["res"])) for lyr, info in lyrs_info.items()])
-        line_l = max_l_lyr + max_l_res + 19
-        print(line_l * "-")
-        print("General layer info")
-        print(line_l * "-")
-        print(f"{'layer':{max_l_lyr}} : {'dtype':{9}} {'crs':{5}} {'res':{max_l_res}}")
-        print(line_l * "-")
-        for lyr, info in lyrs_info.items():
-            print(
-                f"{lyr:{max_l_lyr}} : {str(info['dtype']):{9}} {str(info['crs']):{5}} {str(info['res']):{max_l_res}}"
-            )
-        print(line_l * "-")
-        print("")
+            # print general layer information
+            max_l_lyr = max(len(r) for r in lyrs_info.keys())
 
-        # part b) merge strategy dependend information
-        for merge in lyrs_info[list(lyrs_info.keys())[0]]["merge"].keys():
-            mtypes = lyrs_info[list(lyrs_info.keys())[0]]["merge"][merge]["strategies"]
-            total_n = sum([info["merge"][merge]["n"] for info in lyrs_info.values()])
-            total_size = sum(
-                [info["merge"][merge]["size"] for info in lyrs_info.values()]
-            )
-            max_shape = max(
-                [info["merge"][merge]["shape"] for info in lyrs_info.values()]
-            )
-            max_l_n = len(f"{total_n}")
-            max_l_size = len(f"{total_size:.2f}")
-            max_l_shape = len(str(max_shape))
-            line_l = max_l_lyr + max_l_n + max_l_size + max_l_shape + 18
+            # part a) general information
+            max_l_res = max([len(str(info["res"])) for lyr, info in lyrs_info.items()])
+            line_l = max_l_lyr + max_l_res + 19
             print(line_l * "-")
-            print(f"Scenario: 'merge' = {' or '.join([str(x) for x in mtypes])}")
+            print("General layer info")
             print(line_l * "-")
             print(
-                f"{'layer':{max_l_lyr}} : {'size':^{max_l_size+3}}  {'tile n':^{max_l_n+8}}  {'tile shape':^{max_l_shape}}"
+                f"{'layer':{max_l_lyr}} : {'dtype':{9}} {'crs':{5}} {'res':{max_l_res}}"
             )
             print(line_l * "-")
             for lyr, info in lyrs_info.items():
-                lyr_info = info["merge"][merge]
                 print(
-                    f"{lyr:{max_l_lyr}} : {lyr_info['size']:>{max_l_size}.2f} Gb  {lyr_info['n']:>{max_l_n}} tile(s)  {str(lyr_info['shape']):>{max_l_shape}}"
+                    f"{lyr:{max_l_lyr}} : {str(info['dtype']):{9}} {str(info['crs']):{5}} {str(info['res']):{max_l_res}}"
                 )
             print(line_l * "-")
-            print(
-                f"{'Total':{max_l_lyr}}   {total_size:{max_l_size}.2f} Gb  {total_n:{max_l_n}} tile(s)"
-            )
-            print(line_l * "-")
             print("")
+
+            # part b) merge strategy dependend information
+            for merge in lyrs_info[list(lyrs_info.keys())[0]]["merge"].keys():
+                total_n = sum(
+                    [info["merge"][merge]["n"] for info in lyrs_info.values()]
+                )
+                total_size = sum(
+                    [info["merge"][merge]["size"] for info in lyrs_info.values()]
+                )
+                shapes = [
+                    str(info["merge"][merge]["shape"]) for info in lyrs_info.values()
+                ]
+                max_l_n = len(f"{total_n}")
+                max_l_size = len(f"{total_size:.2f}")
+                max_l_shape = max([len(x) for x in shapes])
+                line_l = max_l_lyr + max_l_n + max_l_size + max_l_shape + 18
+                print(line_l * "-")
+                print(f"Scenario: 'merge' = {merge}")
+                print(line_l * "-")
+                print(
+                    f"{'layer':{max_l_lyr}} : {'size':^{max_l_size+3}}  {'tile n':^{max_l_n+8}}  {'tile shape':^{max_l_shape}}"
+                )
+                print(line_l * "-")
+                for lyr, info in lyrs_info.items():
+                    lyr_info = info["merge"][merge]
+                    print(
+                        f"{lyr:{max_l_lyr}} : {lyr_info['size']:>{max_l_size}.2f} Gb  {lyr_info['n']:>{max_l_n}} tile(s)  {str(lyr_info['shape']):>{max_l_shape}}"
+                    )
+                print(line_l * "-")
+                print(
+                    f"{'Total':{max_l_lyr}}   {total_size:{max_l_size}.2f} Gb  {total_n:{max_l_n}} tile(s)"
+                )
+                print(line_l * "-")
+                print("")
 
     def _create_context(self, **kwargs):
         """Create execution context with dynamic space/time."""
@@ -558,6 +581,110 @@ class TileHandler:
         }
         context.update(kwargs)
         return context
+
+    def _postprocess(self, in_dict):
+        """Postprocesses the response to ensure homogeneous response format,
+        i.e. a dictionary containing xarrays with a at most 3 dimensions
+        """
+        out_dict = {}
+        for k in in_dict.keys():
+            in_arr = in_dict[k]
+            # convert collections (grouped outputs) into arrays
+            if isinstance(in_arr, Collection):
+                grouper_vals = [x.name for x in in_arr]
+                in_arr = xr.concat([x for x in in_arr], dim="grouper")
+                in_arr = in_arr.assign_coords(grouper=grouper_vals)
+            # add crs information
+            in_arr = in_arr.rio.write_crs(self.crs)
+            # flatten 4D outputs to 3D
+            re_dims = TileHandler._get_nonspatial_dims(in_arr)
+            if len(re_dims) > 1:
+                in_arr = in_arr.stack(grouper=re_dims)
+                in_arr = in_arr.transpose("grouper", ...)
+            # persist band names for 3D outputs
+            re_dims = TileHandler._get_nonspatial_dims(in_arr)
+            if len(re_dims):
+                re_dim = re_dims[0]
+                re_vals = [str(x) for x in in_arr[re_dim].values]
+                in_arr.attrs["long_name"] = re_vals
+                in_arr.attrs["band_variable"] = re_dim
+            out_dict[k] = in_arr
+        return out_dict
+
+    def _equalize_bands(self, src_paths):
+        """Postprocesses the response to ensure avaliability of all bands"""
+        # get non-spatial dims (i.e. band dimension)
+        with rxr.open_rasterio(src_paths[0]) as src_arr:
+            band_dims = TileHandler._get_nonspatial_dims(src_arr)
+            band_dim = band_dims[0]
+            n_bands = len(src_arr[band_dim])
+        # ensure same bands across arrays
+        if n_bands > 1:
+            band_dim = band_dims[0]
+            # retrieve values for non-spatial dim
+            band_names = []
+            for src in src_paths:
+                with rxr.open_rasterio(src) as src_arr:
+                    for band in src_arr.long_name:
+                        band_names.append(band)
+            band_names = list(np.unique(sorted(band_names)))
+            # introduce missing values for single arrays
+            for src in src_paths:
+                with rxr.open_rasterio(src) as src_arr:
+                    # create list to hold any new bands that need to be created
+                    new_bands = []
+                    for band in band_names:
+                        if band not in src_arr.long_name:
+                            # create an array of NaNs with the same shape as one band of src_arr
+                            nan_band = np.full_like(
+                                src_arr.isel(**{band_dim: 0}), np.nan
+                            )
+                            nan_band = np.expand_dims(nan_band, 0)
+                            coords = {
+                                c: (c, src_arr.coords[c].values) for c in src_arr.dims
+                            }
+                            coords.update({band_dim: (band_dim, np.array([0]))})
+                            new_band = xr.DataArray(
+                                nan_band, dims=src_arr.dims, coords=coords, name=band
+                            )
+                            new_band.attrs["long_name"] = band
+                            new_bands.append(new_band)
+                    # combine original bands with new, previosuly missing bands
+                    if new_bands:
+                        dst_arr = xr.concat(new_bands + [src_arr], dim=band_dim)
+                        dst_arr.attrs["long_name"] = [
+                            *[x.long_name for x in new_bands],
+                            *src_arr.long_name,
+                        ]
+                    else:
+                        dst_arr = src_arr
+                    band_order = [dst_arr.long_name.index(x) for x in band_names]
+                    dst_arr = dst_arr.isel(**{band_dim: band_order})
+                    dst_arr.attrs["long_name"] = band_names
+                    dst_arr[band_dim] = np.arange(len(band_names)) + 1
+                # write updated array to disk
+                TileHandler._write_to_origin(dst_arr, src)
+
+    @staticmethod
+    def _get_nonspatial_dims(in_arr):
+        arr_dims = list(in_arr.dims)
+        if sq.dimensions.X in arr_dims:
+            arr_dims.remove(sq.dimensions.X)
+        if sq.dimensions.Y in arr_dims:
+            arr_dims.remove(sq.dimensions.Y)
+        return arr_dims
+
+    def _add_band_idx(self, in_arr):
+        # introduce band coordinate as index variable
+        coords = {}
+        coords["band"] = (["band"], np.array([1]))
+        coords.update({dim: (dim, in_arr[dim].values) for dim in in_arr.dims})
+        out_arr = xr.DataArray(
+            data=np.expand_dims(in_arr.values, 0),
+            coords=coords,
+            attrs=in_arr.attrs,
+        )
+        return out_arr
 
     @staticmethod
     def _execute_workflow(context):
@@ -609,7 +736,13 @@ class TileHandler:
                 for x in TileHandler._get_class_components(sq.components.space).values()
             }
         )
-        dims = list(np.unique([dim_lut[x] for x in dims]))
+        _dims = []
+        for x in dims:
+            try:
+                _dims.append(dim_lut[x])
+            except KeyError:
+                pass
+        dims = list(np.unique(_dims))
         return dims
 
     @staticmethod
@@ -653,12 +786,14 @@ class TileHandler:
             bbox_tile = box(*tile)
             bbox_tile = gpd.GeoDataFrame(geometry=[bbox_tile], crs=crs)
             if precise:
-                tile_shape = bbox_tile.overlay(space, how="intersection")
-                if len(tile_shape):
+                tile_shape = bbox_tile.overlay(space, how="intersection").dissolve()
+                if ((tile_shape.area / bbox_tile.area) > 0.0001).iloc[0]:
                     spatial_grid.append(SpatialExtent(tile_shape))
             else:
-                if space.intersects(bbox_tile.unary_union).iloc[0]:
-                    spatial_grid.append(SpatialExtent(bbox_tile))
+                if space.intersects(bbox_tile.unary_union).any():
+                    tile_shape = bbox_tile.overlay(space, how="intersection").dissolve()
+                    if ((tile_shape.area / bbox_tile.area) > 0.0001).iloc[0]:
+                        spatial_grid.append(SpatialExtent(bbox_tile))
         return spatial_grid
 
     @staticmethod
@@ -674,10 +809,23 @@ class TileHandler:
                 components[attribute] = getattr(class_obj, attribute)
         return components
 
+    @staticmethod
+    def _write_to_origin(arr, path):
+        """
+        Write an opened rioxarray back to its original path,
+        circumvents permission errors by temporarily writing to a new path
+        & renaming afterwards
+        """
+        suffix = str(uuid.uuid4()).replace("-", "_")
+        base, ext = os.path.splitext(path)
+        temp_path = f"{base}_{suffix}_{ext}"
+        arr.rio.to_raster(temp_path)
+        shutil.move(temp_path, path)
+
 
 class TileHandlerParallel(TileHandler):
     """Handler for executing a query in a tiled manner leveraging multiprocessing.
-    The heavyweight and repetitive initialisation via estimate_size() is carried out once and
+    The heavyweight and repetitive initialisation via preview() is carried out once and
     then tiles are processed in parallel.
 
     Note that for STACCubes, parallel processing is per default already enabled for data loading. Parallel processing via TileHandlerParallel therefore only makes sense if the workflow encapsulated in the recipe is significantly more time-consuming than the actual data loading. It must also be noted that the available RAM resources must be sufficient to process, n_procs times the amount of data that arises in the case of a simple TileHandler. This usually requires an adjustment of the chunksizes, which in turn may increase the amount of redundant data fetching processes (because the same data may be loaded for neighbouring smaller tiles). The possible advantage of using the ParallelProcessor therefore depends on the specific recipe and is not trivial. In case of doubt, the use of the TileHandler without multiprocessing is recommended.
@@ -692,7 +840,7 @@ class TileHandlerParallel(TileHandler):
         kwargs["reauth"] = False
         super().__init__(*args, **kwargs)
         self.n_procs = n_procs
-        self.estimate_size()
+        self.preview()
 
     def execute(self):
         # get grid idxs
