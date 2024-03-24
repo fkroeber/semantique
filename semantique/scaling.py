@@ -478,21 +478,24 @@ class TileHandler:
                 arr_z = arr.isel(**{dim: 0 for dim in arr_xy_dims})
                 # extrapolate layer information for different merging strategies
                 lyr_info["merge"] = {}
-                # a) merge into single array
-                scale = xy_pixels / arr_xy.size
-                lyr_info["merge"]["single"] = {}
-                lyr_info["merge"]["single"]["n"] = 1
-                lyr_info["merge"]["single"]["size"] = scale * arr.nbytes / (1024**3)
-                lyr_info["merge"]["single"]["shape"] = (
+                # a) no merge
+                scale = len(self.grid) * (self.chunksize_s**2) / arr_xy.size
+                lyr_info["merge"]["None"] = {}
+                lyr_info["merge"]["None"]["n"] = len(self.grid)
+                lyr_info["merge"]["None"]["size"] = scale * arr.nbytes / (1024**3)
+                lyr_info["merge"]["None"]["shape"] = (
                     *arr_z.shape,
-                    num_pixels_x,
-                    num_pixels_y,
+                    self.chunksize_s,
+                    self.chunksize_s,
                 )
                 # b) vrt
                 vrt_scales = [4, 8, 16, 32, 64, 128, 256, 512]
                 size_tiles = lyr_info["merge"]["None"]["size"]
                 size_vrt = sum(
-                    [lyr_info["merge"]["single"]["size"] / (x**2) for x in vrt_scales]
+                    [
+                        arr.nbytes * xy_pixels / arr_xy.size / (1024**3) / (x**2)
+                        for x in vrt_scales
+                    ]
                 )
                 lyr_info["merge"]["vrt"] = {}
                 lyr_info["merge"]["vrt"]["n"] = len(self.grid)
@@ -502,15 +505,15 @@ class TileHandler:
                     self.chunksize_s,
                     self.chunksize_s,
                 )
-                # c) no merge
-                scale = len(self.grid) * (self.chunksize_s**2) / arr_xy.size
-                lyr_info["merge"]["None"] = {}
-                lyr_info["merge"]["None"]["n"] = len(self.grid)
-                lyr_info["merge"]["None"]["size"] = scale * arr.nbytes / (1024**3)
-                lyr_info["merge"]["None"]["shape"] = (
+                # c) merge into single array
+                scale = xy_pixels / arr_xy.size
+                lyr_info["merge"]["single"] = {}
+                lyr_info["merge"]["single"]["n"] = 1
+                lyr_info["merge"]["single"]["size"] = scale * arr.nbytes / (1024**3)
+                lyr_info["merge"]["single"]["shape"] = (
                     *arr_z.shape,
-                    self.chunksize_s,
-                    self.chunksize_s,
+                    num_pixels_x,
+                    num_pixels_y,
                 )
                 lyrs_info[layer] = lyr_info
 
