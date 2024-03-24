@@ -114,6 +114,7 @@ def virtual_merge(
         nodataval = first.nodatavals[0]
         crs_wkt = first.crs.wkt
         indexes = first.indexes
+        descriptions = first.descriptions
         colorinterps = first.colorinterp
         block_shapes = first.block_shapes
         dtypes = first.dtypes
@@ -168,9 +169,6 @@ def virtual_merge(
     if dtype is not None:
         dt = dtype
 
-    # create destination array
-    # dest = np.zeros((output_count, output_height, output_width), dtype=dt)
-
     # Create destination VRT.
     vrtdataset = ET.Element(
         "VRTDataset",
@@ -207,8 +205,8 @@ def virtual_merge(
         nodataval = None
 
     # Create VRT bands.
-    for bidx, ci, block_shape, dtype in zip(
-        indexes, colorinterps, block_shapes, dtypes
+    for bidx, desc, ci, block_shape, dtype in zip(
+        indexes, descriptions, colorinterps, block_shapes, dtypes
     ):
         vrtrasterband = ET.SubElement(
             vrtdataset,
@@ -226,6 +224,7 @@ def virtual_merge(
                 ET.SubElement(vrtrasterband, "HideNoDataValue").text = "1"
 
         ET.SubElement(vrtrasterband, "ColorInterp").text = ci.name.capitalize()
+        ET.SubElement(vrtrasterband, "Description").text = desc
 
     # Add sources to VRT bands.
     for idx, dataset in enumerate(datasets):
