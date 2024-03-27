@@ -212,6 +212,11 @@ class TileHandler:
         elif self.tile_dim == sq.dimensions.SPACE:
             # create spatial grid
             if self.merge == "vrt" or self.merge is None:
+                # tbd: allow both options of precise_shp here for both
+                # set default for both to True (to ensure consistent results)
+                # False only used for vrt to ensure same tile sizes (-> dl afterwards) & easier estimation of sizes
+                # both things not really needed
+                # precise_shp = True
                 precise_shp = False
             else:
                 precise_shp = True
@@ -488,18 +493,22 @@ class TileHandler:
             self.get_tile_grid()
 
         # preview run of workflow for a single tile
-        tile = self.grid[0]
-        context = self._create_context(
-            **{self.tile_dim: tile}, preview=True, cache=None
-        )
-        qp, response = TileHandler._execute_workflow(context)
+        tile_idx = 0
+        valid_response = False
+        while not valid_response:
+            tile = self.grid[tile_idx]
+            context = self._create_context(
+                **{self.tile_dim: tile}, preview=True, cache=None
+            )
+            qp, response = TileHandler._execute_workflow(context)
+            valid_response = True if response else False
+            tile_idx += 1
 
         # postprocess response
-        if response:
-            if self.tile_dim == sq.dimensions.TIME:
-                response = self._postprocess_temporal(response)
-            elif self.tile_dim == sq.dimensions.SPACE:
-                response = self._postprocess_spatial(response)
+        if self.tile_dim == sq.dimensions.TIME:
+            response = self._postprocess_temporal(response)
+        elif self.tile_dim == sq.dimensions.SPACE:
+            response = self._postprocess_spatial(response)
 
         # init cache
         if self.caching:
@@ -792,7 +801,13 @@ class TileHandler:
         return time_grid
 
     @staticmethod
-    def create_spatial_grid(space, spatial_resolution, chunksize_s, crs, precise=True):
+    def create_spatial_grid(
+        space,
+        spatial_resolution,
+        chunksize_s,
+        crs,
+        precise=True,
+    ):
         # create coarse spatial grid
         coarse_res = list(np.array(spatial_resolution) * chunksize_s)
         extent = space.rasterize(coarse_res, crs, all_touched=True)
