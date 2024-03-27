@@ -240,7 +240,10 @@ class TileHandler:
 
             if response:
                 # postprocess response
-                response = self._postprocess(response)
+                if self.tile_dim == sq.dimensions.TIME:
+                    response = self._postprocess_temporal(response)
+                elif self.tile_dim == sq.dimensions.SPACE:
+                    response = self._postprocess_spatial(response)
                 # write result (in-memory or to disk)
                 if self.merge == "single":
                     self.tile_results.append(response)
@@ -282,124 +285,171 @@ class TileHandler:
             dst.update_tags(ns="rio_overview")
             dst.close()
 
+    def _merge_temporal(src_arrs):
+        """Merges temporally stratified results into an array"""
+        if isinstance(src_arrs[0], xr.core.dataarray.DataArray):
+            # merge across time
+            dst_arr = xr.concat(src_arrs, dim=sq.dimensions.TIME)
+        # this can be omitted?
+        elif isinstance(src_arrs[0], Collection):
+            dst_arrs = []
+            # merge collection results
+            for collection in src_arrs:
+                grouper_vals = [x.name for x in collection]
+                arr = xr.concat([x for x in collection], dim="grouper")
+                arr = arr.assign_coords(grouper=grouper_vals)
+                dst_arrs.append(arr)
+            # merge across time
+            dst_arr = xr.concat(dst_arrs, dim=sq.dimensions.TIME)
+        else:
+            raise NotImplementedError(f"No method for merging source array {src_arrs}.")
+        return dst_arr
+
+    def _merge_spatial(
+        src_arrs,
+        crs,
+    ):
+        """Merges spatially stratified results into an array"""
+        # tbd: remove superfluous parts here
+        # get dimensions of input array
+        arr_dims = list(src_arrs[0].dims)
+        # remove spatial dimensions
+        if sq.dimensions.X in arr_dims:
+            arr_dims.remove(sq.dimensions.X)
+        if sq.dimensions.Y in arr_dims:
+            arr_dims.remove(sq.dimensions.Y)
+        # check if 2D/3D input arrays
+        if len(arr_dims):
+            # possibly remaining dimension is the temporal one (e.g. year, season, etc)
+            # retrieve temporal values
+            time_dim = arr_dims[0]
+            time_vals = [x[time_dim] for x in src_arrs]
+            time_vals = np.unique(xr.concat(time_vals, dim=time_dim).values)
+            # for each timestep merge results spatially first
+            arrs_main = []
+            for time_val in time_vals:
+                arrs_sub = []
+                for arr in src_arrs:
+                    # slice array for given timestep
+                    try:
+                        arr_slice = arr.sel(**{time_dim: time_val})
+                    except KeyError:
+                        continue
+                    # introduce band coordinate as index variable
+                    coords = {}
+                    coords["band"] = (["band"], np.array([1]))
+                    coords.update(
+                        {dim: (dim, arr_slice[dim].values) for dim in arr_slice.dims}
+                    )
+                    new_arr = xr.DataArray(
+                        data=np.expand_dims(arr_slice.values, 0),
+                        coords=coords,
+                        attrs=arr_slice.attrs,
+                    )
+                    new_arr = new_arr.rio.write_crs(crs)
+                    arrs_sub.append(new_arr)
+                # spatial merge
+                merged_arr = merge_arrays(arrs_sub, crs=crs)
+                merged_arr = merged_arr[0].drop_vars("band")
+                # re-introducing time dimension
+                coords = {}
+                coords[time_dim] = ([time_dim], np.array([time_val]))
+                coords.update(
+                    {dim: (dim, merged_arr[dim].values) for dim in merged_arr.dims}
+                )
+                new_arr = xr.DataArray(
+                    data=np.expand_dims(merged_arr.values, 0),
+                    coords=coords,
+                    attrs=merged_arr.attrs,
+                )
+                new_arr = new_arr.rio.write_crs(crs)
+                arrs_main.append(new_arr)
+            # merge across time
+            joint_arr = xr.concat(arrs_main, dim=time_dim)
+            # persist band names
+            joint_arr.attrs["long_name"] = [str(x) for x in joint_arr[time_dim].values]
+            joint_arr.attrs["band_variable"] = time_dim
+        else:
+            # direct spatial merge possible
+            arrs = []
+            for arr in src_arrs:
+                # introduce band coordinate as index variable
+                coords = {}
+                coords["band"] = (["band"], np.array([1]))
+                coords.update({dim: (dim, arr[dim].values) for dim in arr.dims})
+                new_arr = xr.DataArray(
+                    data=np.expand_dims(arr.values, 0),
+                    coords=coords,
+                    attrs=arr.attrs,
+                )
+                new_arr = new_arr.rio.write_crs(crs)
+                arrs.append(new_arr)
+            # spatial merge
+            joint_arr = merge_arrays(arrs, crs=crs)
+            joint_arr = joint_arr[0].drop_vars("band")
+        return joint_arr
+
+    def _postprocess_spatial(self, in_dict):
+        """Postprocesses the response to ensure homogeneous response format,
+        i.e. a dictionary containing xarrays with a at most 3 dimensions
+        """
+        out_dict = {}
+        for k in in_dict.keys():
+            in_arr = in_dict[k]
+            # convert collections (grouped outputs) into arrays
+            # problematic since grouper variable may exist already
+            # needed for grouped outputs!
+            if isinstance(in_arr, Collection):
+                grouper_vals = [x.name for x in in_arr]
+                if isinstance(grouper_vals[0], tuple):
+                    grouper_vals = [str(x) for x in grouper_vals]
+                in_arr = xr.concat([x for x in in_arr], dim="_grouper")
+                in_arr = in_arr.assign_coords(_grouper=grouper_vals)
+            # add crs information
+            in_arr = in_arr.rio.write_crs(self.crs)
+            # flatten 4D outputs to 3D
+            re_dims = TileHandler._get_nonspatial_dims(in_arr)
+            if len(re_dims) > 1:
+                in_arr = in_arr.stack(grouper=re_dims)
+                in_arr = in_arr.transpose("grouper", ...)
+            # persist band names for 3D outputs
+            re_dims = TileHandler._get_nonspatial_dims(in_arr)
+            if len(re_dims):
+                re_dim = re_dims[0]
+                re_vals = [str(x) for x in in_arr[re_dim].values]
+                in_arr.attrs["long_name"] = re_vals
+                in_arr.attrs["band_variable"] = re_dim
+            out_dict[k] = in_arr
+        return out_dict
+
+    def _postprocess_temporal(self, in_dict):
+        """Postprocesses the response to ensure homogeneous response format"""
+        out_dict = {}
+        for k in in_dict.keys():
+            in_arr = in_dict[k]
+            # convert collections (grouped outputs) into arrays
+            if isinstance(in_arr, Collection):
+                grouper_vals = [x.name for x in in_arr]
+                in_arr = xr.concat([x for x in in_arr], dim="_grouper")
+                in_arr = in_arr.assign_coords(_grouper=grouper_vals)
+            out_dict[k] = in_arr
+        return out_dict
+
     def merge_single(self):
         """Merge results obtained for individual tiles by stitching them
         temporally or spatially depending on the tiling dimension.
         """
         joint_res = {}
         res_keys = self.tile_results[0].keys()
+        # merge recipes results
         for k in res_keys:
-            # retrieve partial results
-            src_arr = [x[k] for x in self.tile_results]
-            # if temporal result
+            src_arrs = [x[k] for x in self.tile_results]
             if self.tile_dim == sq.dimensions.TIME:
-                if isinstance(src_arr[0], xr.core.dataarray.DataArray):
-                    joint_res[k] = xr.concat(src_arr, dim=sq.dimensions.TIME)
-                elif isinstance(src_arr[0], Collection):
-                    arrs = []
-                    # merge collection results
-                    for collection in src_arr:
-                        grouper_vals = [x.name for x in collection]
-                        arr = xr.concat([x for x in collection], dim="grouper")
-                        arr = arr.assign_coords(grouper=grouper_vals)
-                        arrs.append(arr)
-                    # merge across time
-                    joint_arr = xr.concat(arrs, dim=sq.dimensions.TIME)
-                    joint_arr.name = k
-                    joint_res[k] = joint_arr
-                else:
-                    raise NotImplementedError(
-                        f"No method for merging source array {src_arr}."
-                    )
-            # if spatial result
+                joint_arr = TileHandler._merge_temporal(src_arrs)
             elif self.tile_dim == sq.dimensions.SPACE:
-                # get dimensions of input array
-                arr_dims = list(src_arr[0].dims)
-                # remove spatial dimensions
-                if sq.dimensions.X in arr_dims:
-                    arr_dims.remove(sq.dimensions.X)
-                if sq.dimensions.Y in arr_dims:
-                    arr_dims.remove(sq.dimensions.Y)
-                # check if 2D/3D input arrays
-                if len(arr_dims):
-                    # possibly remaining dimension is the temporal one (e.g. year, season, etc)
-                    # retrieve temporal values
-                    time_dim = arr_dims[0]
-                    time_vals = [x[time_dim] for x in src_arr]
-                    time_vals = np.unique(xr.concat(time_vals, dim=time_dim).values)
-                    # for each timestep merge results spatially first
-                    arrs_main = []
-                    for time_val in time_vals:
-                        arrs_sub = []
-                        for arr in src_arr:
-                            # slice array for given timestep
-                            try:
-                                arr_slice = arr.sel(**{time_dim: time_val})
-                            except KeyError:
-                                continue
-                            # introduce band coordinate as index variable
-                            coords = {}
-                            coords["band"] = (["band"], np.array([1]))
-                            coords.update(
-                                {
-                                    dim: (dim, arr_slice[dim].values)
-                                    for dim in arr_slice.dims
-                                }
-                            )
-                            new_arr = xr.DataArray(
-                                data=np.expand_dims(arr_slice.values, 0),
-                                coords=coords,
-                                attrs=arr_slice.attrs,
-                            )
-                            new_arr = new_arr.rio.write_crs(self.crs)
-                            arrs_sub.append(new_arr)
-                        # spatial merge
-                        merged_arr = merge_arrays(arrs_sub, crs=self.crs)
-                        merged_arr = merged_arr[0].drop_vars("band")
-                        # re-introducing time dimension
-                        coords = {}
-                        coords[time_dim] = ([time_dim], np.array([time_val]))
-                        coords.update(
-                            {
-                                dim: (dim, merged_arr[dim].values)
-                                for dim in merged_arr.dims
-                            }
-                        )
-                        new_arr = xr.DataArray(
-                            data=np.expand_dims(merged_arr.values, 0),
-                            coords=coords,
-                            attrs=merged_arr.attrs,
-                        )
-                        new_arr = new_arr.rio.write_crs(self.crs)
-                        arrs_main.append(new_arr)
-                    # merge across time
-                    joint_arr = xr.concat(arrs_main, dim=time_dim)
-                    # persist band names
-                    joint_arr.attrs["long_name"] = [
-                        str(x) for x in joint_arr[time_dim].values
-                    ]
-                    joint_arr.attrs["band_variable"] = time_dim
-                else:
-                    # direct spatial merge possible
-                    arrs = []
-                    for arr in src_arr:
-                        # introduce band coordinate as index variable
-                        coords = {}
-                        coords["band"] = (["band"], np.array([1]))
-                        coords.update({dim: (dim, arr[dim].values) for dim in arr.dims})
-                        new_arr = xr.DataArray(
-                            data=np.expand_dims(arr.values, 0),
-                            coords=coords,
-                            attrs=arr.attrs,
-                        )
-                        new_arr = new_arr.rio.write_crs(self.crs)
-                        arrs.append(new_arr)
-                    # spatial merge
-                    joint_arr = merge_arrays(arrs, crs=self.crs)
-                    joint_arr = joint_arr[0].drop_vars("band")
-                # rename & write to overall dict
-                joint_arr.name = k
-                joint_res[k] = joint_arr
+                joint_arr = TileHandler._merge_spatial(src_arrs, self.crs)
+            joint_arr.name = k
+            joint_res[k] = joint_arr
         self.joint_res = joint_res
         # write to out_dir
         if self.out_dir:
@@ -443,6 +493,13 @@ class TileHandler:
             **{self.tile_dim: tile}, preview=True, cache=None
         )
         qp, response = TileHandler._execute_workflow(context)
+
+        # postprocess response
+        if response:
+            if self.tile_dim == sq.dimensions.TIME:
+                response = self._postprocess_temporal(response)
+            elif self.tile_dim == sq.dimensions.SPACE:
+                response = self._postprocess_spatial(response)
 
         # init cache
         if self.caching:
@@ -584,35 +641,6 @@ class TileHandler:
         }
         context.update(kwargs)
         return context
-
-    def _postprocess(self, in_dict):
-        """Postprocesses the response to ensure homogeneous response format,
-        i.e. a dictionary containing xarrays with a at most 3 dimensions
-        """
-        out_dict = {}
-        for k in in_dict.keys():
-            in_arr = in_dict[k]
-            # convert collections (grouped outputs) into arrays
-            if isinstance(in_arr, Collection):
-                grouper_vals = [x.name for x in in_arr]
-                in_arr = xr.concat([x for x in in_arr], dim="grouper")
-                in_arr = in_arr.assign_coords(grouper=grouper_vals)
-            # add crs information
-            in_arr = in_arr.rio.write_crs(self.crs)
-            # flatten 4D outputs to 3D
-            re_dims = TileHandler._get_nonspatial_dims(in_arr)
-            if len(re_dims) > 1:
-                in_arr = in_arr.stack(grouper=re_dims)
-                in_arr = in_arr.transpose("grouper", ...)
-            # persist band names for 3D outputs
-            re_dims = TileHandler._get_nonspatial_dims(in_arr)
-            if len(re_dims):
-                re_dim = re_dims[0]
-                re_vals = [str(x) for x in in_arr[re_dim].values]
-                in_arr.attrs["long_name"] = re_vals
-                in_arr.attrs["band_variable"] = re_dim
-            out_dict[k] = in_arr
-        return out_dict
 
     def _equalize_bands(self, src_paths):
         """Postprocesses the response to ensure avaliability of all bands"""
