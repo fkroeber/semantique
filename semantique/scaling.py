@@ -151,7 +151,7 @@ class TileHandler:
             self.signing_thread.daemon = True
             self.signing_thread.start()
 
-    def continuous_signing(self, interval=30):
+    def continuous_signing(self, interval=120):
         while not self.signing_thread_event.is_set():
             thread = threading.Thread(target=self.datacube._sign_metadata)
             thread.daemon = True
