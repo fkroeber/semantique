@@ -711,6 +711,9 @@ class STACCube(Datacube):
         in fetching data. Defaults to :obj:`None`, i.e. to use the threaded scheduler as
         set by dask as a default for arrays.
 
+        * **reauth_individual** (:obj:`bool`): Should the items be resigned/reauthenticated
+        before loading them? Defaults to False.
+
         * **value_type_mapping** (:obj:`dict`): How do value type encodings in
           the layout map to the value types used by semantique?
           Defaults to a one-to-one mapping: ::
@@ -772,6 +775,7 @@ class STACCube(Datacube):
             "trim": True,
             "group_by_solar_day": True,
             "dask_params": None,
+            "reauth_individual": False,
             "value_type_mapping": {
                 "nominal": "nominal",
                 "ordinal": "ordinal",
@@ -916,6 +920,10 @@ class STACCube(Datacube):
             empty_arr = xr.full_like(extent, np.NaN)
             return empty_arr
 
+        # reauth
+        if self.config["reauth_individual"]:
+            item_coll = self._sign_metadata(item_coll)
+
         data = stackstac.stack(
             item_coll,
             assets=[metadata["name"]],
@@ -1032,9 +1040,8 @@ class STACCube(Datacube):
         data = data.where(data["spatial_feats"].notnull())
         return data
 
-    def _sign_metadata(self):
+    def _sign_metadata(self, items):
         # retrieve collections root & item ids
-        items = list(self.src)
         roots = [x.get_root_link().href for x in items]
         # create dictionary grouped by collection
         curr_colls = {}
@@ -1059,13 +1066,13 @@ class STACCube(Datacube):
                     status_forcelist=[408, 502, 503, 504],
                     allowed_methods=None,
                 )
+                client = pystac_client.Client.open(
+                    coll,
+                    modifier=auth_colls[coll],
+                    stac_io=StacApiIO(max_retries=retry, timeout=1800),
+                )
                 item_chunks = STACCube._divide_chunks(curr_colls[coll]["items"], 100)
                 for chunk in item_chunks:
-                    client = pystac_client.Client.open(
-                        coll,
-                        modifier=auth_colls[coll],
-                        stac_io=StacApiIO(max_retries=retry, timeout=1800),
-                    )
                     item_search = client.search(
                         ids=[x.id for x in chunk],
                         collections=[x.get_collection() for x in chunk],
@@ -1074,8 +1081,7 @@ class STACCube(Datacube):
             else:
                 updated_items.extend(curr_colls[coll]["items"])
         # return signed items
-        updated_coll = pystac.ItemCollection(updated_items)
-        self.src = updated_coll
+        return pystac.ItemCollection(updated_items)
 
     @staticmethod
     def _divide_chunks(lst, k):

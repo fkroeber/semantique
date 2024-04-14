@@ -144,24 +144,23 @@ class TileHandler:
         # create output directory
         if self.out_dir:
             os.makedirs(self.out_dir)
-        # continous re-auth every 30 seconds
+        # continous re-auth
         if self.reauth:
             self.signing_thread_event = threading.Event()
-            self.signing_thread = threading.Thread(target=self.continuous_signing)
+            self.signing_thread = threading.Thread(target=self._continuous_signing)
             self.signing_thread.daemon = True
             self.signing_thread.start()
 
-    def continuous_signing(self, interval=120):
+    def _continuous_signing(self):
         while not self.signing_thread_event.is_set():
-            thread = threading.Thread(target=self.datacube._sign_metadata)
-            thread.daemon = True
-            thread.start()
-            time.sleep(interval)
+            self.datacube.src = self.datacube._sign_metadata(list(self.datacube.src))
+            time.sleep(1)
 
     # join thread when deleting the instance - not working yet
-    # def __del__(self):
-    #     self.signing_thread_event.set()
-    #     self.signing_thread.join(timeout=5)
+    def __del__(self):
+        if self.signing_thread_event.is_set():
+            self.signing_thread_event.set()
+            self.signing_thread.join()
 
     def get_tile_dim(self):
         """Returns dimension usable for tiling & parallelisation of recipe execution.
@@ -286,7 +285,9 @@ class TileHandler:
             virtual_merge(srcs, dst_path=res_path)
             # create overview for vrt
             dst = rio.open(res_path, "r+")
-            dst.build_overviews([4, 8, 16, 32, 64, 128, 256, 512])
+            vrt_scales = [4, 8, 16, 32, 64, 128, 256, 512]
+            vrt_scales = [x for x in vrt_scales if x < max(dst.shape)]
+            dst.build_overviews(vrt_scales)
             dst.update_tags(ns="rio_overview")
             dst.close()
 
