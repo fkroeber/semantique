@@ -158,7 +158,7 @@ class TileHandler:
 
     # join thread when deleting the instance - not working yet
     def __del__(self):
-        if self.signing_thread_event.is_set():
+        if hasattr(self, "signing_thread_event") and self.signing_thread_event.is_set():
             self.signing_thread_event.set()
             self.signing_thread.join()
 
