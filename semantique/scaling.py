@@ -311,10 +311,7 @@ class TileHandler:
             raise NotImplementedError(f"No method for merging source array {src_arrs}.")
         return dst_arr
 
-    def _merge_spatial(
-        src_arrs,
-        crs,
-    ):
+    def _merge_spatial(src_arrs, crs, res):
         """Merges spatially stratified results into an array"""
         # tbd: remove superfluous parts here
         # get dimensions of input array
@@ -369,6 +366,7 @@ class TileHandler:
                     attrs=merged_arr.attrs,
                 )
                 new_arr = new_arr.rio.write_crs(crs)
+                new_arr = TileHandler._write_transform(new_arr, res)
                 arrs_main.append(new_arr)
             # merge across time
             joint_arr = xr.concat(arrs_main, dim=time_dim)
@@ -389,6 +387,7 @@ class TileHandler:
                     attrs=arr.attrs,
                 )
                 new_arr = new_arr.rio.write_crs(crs)
+                new_arr = TileHandler._write_transform(new_arr, res)
                 arrs.append(new_arr)
             # spatial merge
             joint_arr = merge_arrays(arrs, crs=crs)
@@ -425,6 +424,8 @@ class TileHandler:
                 re_vals = [str(x) for x in in_arr[re_dim].values]
                 in_arr.attrs["long_name"] = re_vals
                 in_arr.attrs["band_variable"] = re_dim
+            # add spatial information if missing
+            in_arr = TileHandler._write_transform(in_arr, self.spatial_resolution)
             out_dict[k] = in_arr
         return out_dict
 
@@ -453,7 +454,9 @@ class TileHandler:
             if self.tile_dim == sq.dimensions.TIME:
                 joint_arr = TileHandler._merge_temporal(src_arrs)
             elif self.tile_dim == sq.dimensions.SPACE:
-                joint_arr = TileHandler._merge_spatial(src_arrs, self.crs)
+                joint_arr = TileHandler._merge_spatial(
+                    src_arrs, self.crs, self.spatial_resolution
+                )
             joint_arr.name = k
             joint_res[k] = joint_arr
         self.joint_res = joint_res
@@ -826,20 +829,33 @@ class TileHandler:
             )
         )
         _spatial_grid = [[x[0], y[0], x[1], y[1]] for x, y in _spatial_grid]
+        # preprocess - get proportion of half pixel as min size for overlap
+        pxl_area = np.multiply(*np.abs(spatial_resolution))
+        tile_area = box(*_spatial_grid[0]).area
+        ovlp_thres = 0.5 * pxl_area / tile_area
+        # preprocess - create polygons for point & linestring features
+        pxl_radius = np.sqrt(pxl_area / np.pi)
+        space = space.features.to_crs(extent.rio.crs)
+        space.geometry = space.geometry.apply(
+            lambda x: x.buffer(pxl_radius) if not x.area else x
+        )
         # filter & mask tiles for shape geometry
         spatial_grid = []
-        space = space.features.to_crs(extent.rio.crs)
         for tile in _spatial_grid:
             bbox_tile = box(*tile)
             bbox_tile = gpd.GeoDataFrame(geometry=[bbox_tile], crs=crs)
             if precise:
-                tile_shape = bbox_tile.overlay(space, how="intersection").dissolve()
-                if ((tile_shape.area / bbox_tile.area) > 0.0001).iloc[0]:
+                tile_shape = bbox_tile.overlay(
+                    space, how="intersection", keep_geom_type=False
+                ).dissolve()
+                if ((tile_shape.area / bbox_tile.area) >= ovlp_thres).iloc[0]:
                     spatial_grid.append(SpatialExtent(tile_shape))
             else:
                 if space.intersects(bbox_tile.unary_union).any():
-                    tile_shape = bbox_tile.overlay(space, how="intersection").dissolve()
-                    if ((tile_shape.area / bbox_tile.area) > 0.0001).iloc[0]:
+                    tile_shape = bbox_tile.overlay(
+                        space, how="intersection", keep_geom_type=False
+                    ).dissolve()
+                    if ((tile_shape.area / bbox_tile.area) >= ovlp_thres).iloc[0]:
                         spatial_grid.append(SpatialExtent(bbox_tile))
         return spatial_grid
 
@@ -855,6 +871,30 @@ class TileHandler:
             ):
                 components[attribute] = getattr(class_obj, attribute)
         return components
+
+    @staticmethod
+    def _write_transform(arr, res):
+        """
+        Adds rio metadata if array is of size 1x1,
+        bounds and resolution are written
+
+        Args:
+            arr (xarray): Array
+            res (tuple/list): Resolution in the order of [y, x]
+        """
+        if len(arr.x) == 1 and len(arr.y) == 1:
+            x_coord, y_coord = (
+                arr.x.values[0],
+                arr.y.values[0],
+            )
+            transform = rio.transform.from_origin(
+                west=x_coord - (res[1] / 2),
+                north=y_coord + (res[0] / 2),
+                xsize=res[1],
+                ysize=-res[0],
+            )
+            arr.rio.write_transform(transform, inplace=True)
+        return arr
 
     @staticmethod
     def _write_to_origin(arr, path):
