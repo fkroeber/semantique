@@ -1,18 +1,12 @@
-"""
-Tbd
-* add logger for debugging
-* introduce redundancy in case of failure
-"""
-
+import geopandas as gpd
 import numpy as np
 import os
-import geopandas as gpd
 import pandas as pd
-import rioxarray as rxr
 import rasterio as rio
+import rioxarray as rxr
+import shutil
 import time
 import threading
-import shutil
 import uuid
 import warnings
 import xarray as xr
@@ -20,8 +14,8 @@ import xarray as xr
 from copy import deepcopy
 from itertools import product
 from multiprocess import Pool, Manager
-from rioxarray.merge import merge_arrays
 from shapely.geometry import box
+from rioxarray.merge import merge_arrays
 from tqdm import tqdm
 
 import semantique as sq
@@ -76,6 +70,8 @@ class TileHandler:
         Needs to contain at least mapping instance to process the query against.
         (tbd: exclude mapping as obligatory parameter such that only optional
         parameters need to be placed here)
+
+    tbd: add logger
     """
 
     def __init__(
@@ -96,6 +92,7 @@ class TileHandler:
         verbose=False,
         **config,
     ):
+        # parse args
         self.recipe = recipe
         self.datacube = datacube
         self.space = space
@@ -111,10 +108,7 @@ class TileHandler:
         self.reauth = reauth
         self.verbose = verbose
         self.config = config
-        self.setup()
-
-    def setup(self):
-        # init necessary attributes
+        # init additional args
         self.grid = None
         self.tile_results = []
         self.cache = None
@@ -124,15 +118,7 @@ class TileHandler:
         # retrieve tiling dimension
         self.get_tile_dim()
         # check merge-dependent prerequisites
-        if self.merge == "vrt":
-            pass
-            # warnings.warn(
-            #     "merge == vrt requires all outputs to have the same shape. "
-            #     "Ensure that the recipe does not contain any trim operations. "
-            #     "The datacube configuration will be set to trim=False."
-            # )
-            # self.datacube.config["trim"] = False
-        elif self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
+        if self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
             raise NotImplementedError(
                 "If tiling is done along the temporal dimension, 'vrt' is "
                 "currently not available as a merge strategy."
@@ -151,12 +137,6 @@ class TileHandler:
             self.signing_thread.daemon = True
             self.signing_thread.start()
 
-    def _continuous_signing(self):
-        while not self.signing_thread_event.is_set():
-            self.datacube.src = self.datacube._sign_metadata(list(self.datacube.src))
-            time.sleep(1)
-
-    # join thread when deleting the instance - not working yet
     def __del__(self):
         if hasattr(self, "signing_thread_event") and self.signing_thread_event.is_set():
             self.signing_thread_event.set()
@@ -269,179 +249,6 @@ class TileHandler:
         elif self.merge == "vrt":
             self.merge_vrt()
 
-    def merge_vrt(self):
-        """Merges results obtained for individual tiles by creating a virtual raster.
-        Only available for spatial results obtained by a reduce-over-time. Not implemented
-        for temporal results (i.e. timeseries obtained by a reduce-over-space).
-        """
-        res_keys = [os.path.dirname(x).split(os.sep)[-1] for x in self.tile_results]
-        for k in np.unique(res_keys):
-            res_dir = os.path.join(self.out_dir, k)
-            srcs = [os.path.join(res_dir, x) for x in os.listdir(res_dir)]
-            # ensure same bands across tiles
-            self._equalize_bands(srcs)
-            # create virtual raster
-            res_path = os.path.join(self.out_dir, f"{k}.vrt")
-            virtual_merge(srcs, dst_path=res_path)
-            # create overview for vrt
-            dst = rio.open(res_path, "r+")
-            vrt_scales = [4, 8, 16, 32, 64, 128, 256, 512]
-            vrt_scales = [x for x in vrt_scales if x < max(dst.shape)]
-            dst.build_overviews(vrt_scales)
-            dst.update_tags(ns="rio_overview")
-            dst.close()
-
-    def _merge_temporal(src_arrs):
-        """Merges temporally stratified results into an array"""
-        if isinstance(src_arrs[0], xr.core.dataarray.DataArray):
-            # merge across time
-            dst_arr = xr.concat(src_arrs, dim=sq.dimensions.TIME)
-        # this can be omitted?
-        elif isinstance(src_arrs[0], Collection):
-            dst_arrs = []
-            # merge collection results
-            for collection in src_arrs:
-                grouper_vals = [x.name for x in collection]
-                arr = xr.concat([x for x in collection], dim="grouper")
-                arr = arr.assign_coords(grouper=grouper_vals)
-                dst_arrs.append(arr)
-            # merge across time
-            dst_arr = xr.concat(dst_arrs, dim=sq.dimensions.TIME)
-        else:
-            raise NotImplementedError(f"No method for merging source array {src_arrs}.")
-        return dst_arr
-
-    def _merge_spatial(src_arrs, crs, res):
-        """Merges spatially stratified results into an array"""
-        # tbd: remove superfluous parts here
-        # get dimensions of input array
-        arr_dims = list(src_arrs[0].dims)
-        # remove spatial dimensions
-        if sq.dimensions.X in arr_dims:
-            arr_dims.remove(sq.dimensions.X)
-        if sq.dimensions.Y in arr_dims:
-            arr_dims.remove(sq.dimensions.Y)
-        # check if 2D/3D input arrays
-        if len(arr_dims):
-            # possibly remaining dimension is the temporal one (e.g. year, season, etc)
-            # retrieve temporal values
-            time_dim = arr_dims[0]
-            time_vals = [x[time_dim] for x in src_arrs]
-            time_vals = np.unique(xr.concat(time_vals, dim=time_dim).values)
-            # for each timestep merge results spatially first
-            arrs_main = []
-            for time_val in time_vals:
-                arrs_sub = []
-                for arr in src_arrs:
-                    # slice array for given timestep
-                    try:
-                        arr_slice = arr.sel(**{time_dim: time_val})
-                    except KeyError:
-                        continue
-                    # introduce band coordinate as index variable
-                    coords = {}
-                    coords["band"] = (["band"], np.array([1]))
-                    coords.update(
-                        {dim: (dim, arr_slice[dim].values) for dim in arr_slice.dims}
-                    )
-                    new_arr = xr.DataArray(
-                        data=np.expand_dims(arr_slice.values, 0),
-                        coords=coords,
-                        attrs=arr_slice.attrs,
-                    )
-                    new_arr = new_arr.rio.write_crs(crs)
-                    arrs_sub.append(new_arr)
-                # spatial merge
-                merged_arr = merge_arrays(arrs_sub, crs=crs)
-                merged_arr = merged_arr[0].drop_vars("band")
-                # re-introducing time dimension
-                coords = {}
-                coords[time_dim] = ([time_dim], np.array([time_val]))
-                coords.update(
-                    {dim: (dim, merged_arr[dim].values) for dim in merged_arr.dims}
-                )
-                new_arr = xr.DataArray(
-                    data=np.expand_dims(merged_arr.values, 0),
-                    coords=coords,
-                    attrs=merged_arr.attrs,
-                )
-                new_arr = new_arr.rio.write_crs(crs)
-                new_arr = TileHandler._write_transform(new_arr, res)
-                arrs_main.append(new_arr)
-            # merge across time
-            joint_arr = xr.concat(arrs_main, dim=time_dim)
-            # persist band names
-            joint_arr.attrs["long_name"] = [str(x) for x in joint_arr[time_dim].values]
-            joint_arr.attrs["band_variable"] = time_dim
-        else:
-            # direct spatial merge possible
-            arrs = []
-            for arr in src_arrs:
-                # introduce band coordinate as index variable
-                coords = {}
-                coords["band"] = (["band"], np.array([1]))
-                coords.update({dim: (dim, arr[dim].values) for dim in arr.dims})
-                new_arr = xr.DataArray(
-                    data=np.expand_dims(arr.values, 0),
-                    coords=coords,
-                    attrs=arr.attrs,
-                )
-                new_arr = new_arr.rio.write_crs(crs)
-                new_arr = TileHandler._write_transform(new_arr, res)
-                arrs.append(new_arr)
-            # spatial merge
-            joint_arr = merge_arrays(arrs, crs=crs)
-            joint_arr = joint_arr[0].drop_vars("band")
-        return joint_arr
-
-    def _postprocess_spatial(self, in_dict):
-        """Postprocesses the response to ensure homogeneous response format,
-        i.e. a dictionary containing xarrays with a at most 3 dimensions
-        """
-        out_dict = {}
-        for k in in_dict.keys():
-            in_arr = in_dict[k]
-            # convert collections (grouped outputs) into arrays
-            # problematic since grouper variable may exist already
-            # needed for grouped outputs!
-            if isinstance(in_arr, Collection):
-                grouper_vals = [x.name for x in in_arr]
-                if isinstance(grouper_vals[0], tuple):
-                    grouper_vals = [str(x) for x in grouper_vals]
-                in_arr = xr.concat([x for x in in_arr], dim="_grouper")
-                in_arr = in_arr.assign_coords(_grouper=grouper_vals)
-            # add crs information
-            in_arr = in_arr.rio.write_crs(self.crs)
-            # flatten 4D outputs to 3D
-            re_dims = TileHandler._get_nonspatial_dims(in_arr)
-            if len(re_dims) > 1:
-                in_arr = in_arr.stack(grouper=re_dims)
-                in_arr = in_arr.transpose("grouper", ...)
-            # persist band names for 3D outputs
-            re_dims = TileHandler._get_nonspatial_dims(in_arr)
-            if len(re_dims):
-                re_dim = re_dims[0]
-                re_vals = [str(x) for x in in_arr[re_dim].values]
-                in_arr.attrs["long_name"] = re_vals
-                in_arr.attrs["band_variable"] = re_dim
-            # add spatial information if missing
-            in_arr = TileHandler._write_transform(in_arr, self.spatial_resolution)
-            out_dict[k] = in_arr
-        return out_dict
-
-    def _postprocess_temporal(self, in_dict):
-        """Postprocesses the response to ensure homogeneous response format"""
-        out_dict = {}
-        for k in in_dict.keys():
-            in_arr = in_dict[k]
-            # convert collections (grouped outputs) into arrays
-            if isinstance(in_arr, Collection):
-                grouper_vals = [x.name for x in in_arr]
-                in_arr = xr.concat([x for x in in_arr], dim="_grouper")
-                in_arr = in_arr.assign_coords(_grouper=grouper_vals)
-            out_dict[k] = in_arr
-        return out_dict
-
     def merge_single(self):
         """Merge results obtained for individual tiles by stitching them
         temporally or spatially depending on the tiling dimension.
@@ -469,6 +276,28 @@ class TileHandler:
                 elif self.tile_dim == sq.dimensions.SPACE:
                     out_path = os.path.join(self.out_dir, f"{k}.tif")
                     v.rio.to_raster(out_path)
+
+    def merge_vrt(self):
+        """Merges results obtained for individual tiles by creating a virtual raster.
+        Only available for spatial results obtained by a reduce-over-time. Not implemented
+        for temporal results (i.e. timeseries obtained by a reduce-over-space).
+        """
+        res_keys = [os.path.dirname(x).split(os.sep)[-1] for x in self.tile_results]
+        for k in np.unique(res_keys):
+            res_dir = os.path.join(self.out_dir, k)
+            srcs = [os.path.join(res_dir, x) for x in os.listdir(res_dir)]
+            # ensure same bands across tiles
+            self._equalize_bands(srcs)
+            # create virtual raster
+            res_path = os.path.join(self.out_dir, f"{k}.vrt")
+            virtual_merge(srcs, dst_path=res_path)
+            # create overview for vrt
+            dst = rio.open(res_path, "r+")
+            vrt_scales = [4, 8, 16, 32, 64, 128, 256, 512]
+            vrt_scales = [x for x in vrt_scales if x < max(dst.shape)]
+            dst.build_overviews(vrt_scales)
+            dst.update_tags(ns="rio_overview")
+            dst.close()
 
     def preview(self):
         """Estimator to see if results can be given as one final object
@@ -602,7 +431,8 @@ class TileHandler:
             print(line_l * "-")
             for lyr, info in lyrs_info.items():
                 print(
-                    f"{lyr:{max_l_lyr}} : {str(info['dtype']):{9}} {str(info['crs']):{5}} {str(info['res']):{max_l_res}}"
+                    f"{lyr:{max_l_lyr}} : {str(info['dtype']):{9}} "
+                    f"{str(info['crs']):{5}} {str(info['res']):{max_l_res}}"
                 )
             print(line_l * "-")
             print("")
@@ -626,13 +456,15 @@ class TileHandler:
                 print(f"Scenario: 'merge' = {merge}")
                 print(line_l * "-")
                 print(
-                    f"{'layer':{max_l_lyr}} : {'size':^{max_l_size+3}}  {'tile n':^{max_l_n+8}}  {'tile shape':^{max_l_shape}}"
+                    f"{'layer':{max_l_lyr}} : {'size':^{max_l_size+3}}  "
+                    f"{'tile n':^{max_l_n+8}}  {'tile shape':^{max_l_shape}}"
                 )
                 print(line_l * "-")
                 for lyr, info in lyrs_info.items():
                     lyr_info = info["merge"][merge]
                     print(
-                        f"{lyr:{max_l_lyr}} : {lyr_info['size']:>{max_l_size}.2f} Gb  {lyr_info['n']:>{max_l_n}} tile(s)  {str(lyr_info['shape']):>{max_l_shape}}"
+                        f"{lyr:{max_l_lyr}} : {lyr_info['size']:>{max_l_size}.2f} Gb  "
+                        f"{lyr_info['n']:>{max_l_n}} tile(s)  {str(lyr_info['shape']):>{max_l_shape}}"
                     )
                 print(line_l * "-")
                 print(
@@ -640,6 +472,24 @@ class TileHandler:
                 )
                 print(line_l * "-")
                 print("")
+
+    def _add_band_idx(self, in_arr):
+        """Introduce band coordinate as index variable."""
+        coords = {}
+        coords["band"] = (["band"], np.array([1]))
+        coords.update({dim: (dim, in_arr[dim].values) for dim in in_arr.dims})
+        out_arr = xr.DataArray(
+            data=np.expand_dims(in_arr.values, 0),
+            coords=coords,
+            attrs=in_arr.attrs,
+        )
+        return out_arr
+
+    def _continuous_signing(self):
+        """Calling resign function in a loop."""
+        while not self.signing_thread_event.is_set():
+            self.datacube.src = self.datacube._sign_metadata(list(self.datacube.src))
+            time.sleep(1)
 
     def _create_context(self, **kwargs):
         """Create execution context with dynamic space/time."""
@@ -709,100 +559,156 @@ class TileHandler:
                 # write updated array to disk
                 TileHandler._write_to_origin(dst_arr, src)
 
-    @staticmethod
-    def _get_nonspatial_dims(in_arr):
-        arr_dims = list(in_arr.dims)
+    def _merge_spatial(src_arrs, crs, res):
+        """Merges spatially stratified results into an array"""
+        # tbd: remove superfluous parts here
+        # get dimensions of input array
+        arr_dims = list(src_arrs[0].dims)
+        # remove spatial dimensions
         if sq.dimensions.X in arr_dims:
             arr_dims.remove(sq.dimensions.X)
         if sq.dimensions.Y in arr_dims:
             arr_dims.remove(sq.dimensions.Y)
-        return arr_dims
+        # check if 2D/3D input arrays
+        if len(arr_dims):
+            # possibly remaining dimension is the temporal one (e.g. year, season, etc)
+            # retrieve temporal values
+            time_dim = arr_dims[0]
+            time_vals = [x[time_dim] for x in src_arrs]
+            time_vals = np.unique(xr.concat(time_vals, dim=time_dim).values)
+            # for each timestep merge results spatially first
+            arrs_main = []
+            for time_val in time_vals:
+                arrs_sub = []
+                for arr in src_arrs:
+                    # slice array for given timestep
+                    try:
+                        arr_slice = arr.sel(**{time_dim: time_val})
+                    except KeyError:
+                        continue
+                    # introduce band coordinate as index variable
+                    coords = {}
+                    coords["band"] = (["band"], np.array([1]))
+                    coords.update(
+                        {dim: (dim, arr_slice[dim].values) for dim in arr_slice.dims}
+                    )
+                    new_arr = xr.DataArray(
+                        data=np.expand_dims(arr_slice.values, 0),
+                        coords=coords,
+                        attrs=arr_slice.attrs,
+                    )
+                    new_arr = new_arr.rio.write_crs(crs)
+                    arrs_sub.append(new_arr)
+                # spatial merge
+                merged_arr = merge_arrays(arrs_sub, crs=crs)
+                merged_arr = merged_arr[0].drop_vars("band")
+                # re-introducing time dimension
+                coords = {}
+                coords[time_dim] = ([time_dim], np.array([time_val]))
+                coords.update(
+                    {dim: (dim, merged_arr[dim].values) for dim in merged_arr.dims}
+                )
+                new_arr = xr.DataArray(
+                    data=np.expand_dims(merged_arr.values, 0),
+                    coords=coords,
+                    attrs=merged_arr.attrs,
+                )
+                new_arr = new_arr.rio.write_crs(crs)
+                new_arr = TileHandler._write_transform(new_arr, res)
+                arrs_main.append(new_arr)
+            # merge across time
+            joint_arr = xr.concat(arrs_main, dim=time_dim)
+            # persist band names
+            joint_arr.attrs["long_name"] = [str(x) for x in joint_arr[time_dim].values]
+            joint_arr.attrs["band_variable"] = time_dim
+        else:
+            # direct spatial merge possible
+            arrs = []
+            for arr in src_arrs:
+                # introduce band coordinate as index variable
+                coords = {}
+                coords["band"] = (["band"], np.array([1]))
+                coords.update({dim: (dim, arr[dim].values) for dim in arr.dims})
+                new_arr = xr.DataArray(
+                    data=np.expand_dims(arr.values, 0),
+                    coords=coords,
+                    attrs=arr.attrs,
+                )
+                new_arr = new_arr.rio.write_crs(crs)
+                new_arr = TileHandler._write_transform(new_arr, res)
+                arrs.append(new_arr)
+            # spatial merge
+            joint_arr = merge_arrays(arrs, crs=crs)
+            joint_arr = joint_arr[0].drop_vars("band")
+        return joint_arr
 
-    def _add_band_idx(self, in_arr):
-        # introduce band coordinate as index variable
-        coords = {}
-        coords["band"] = (["band"], np.array([1]))
-        coords.update({dim: (dim, in_arr[dim].values) for dim in in_arr.dims})
-        out_arr = xr.DataArray(
-            data=np.expand_dims(in_arr.values, 0),
-            coords=coords,
-            attrs=in_arr.attrs,
-        )
-        return out_arr
+    def _merge_temporal(src_arrs):
+        """Merges temporally stratified results into an array"""
+        if isinstance(src_arrs[0], xr.core.dataarray.DataArray):
+            # merge across time
+            dst_arr = xr.concat(src_arrs, dim=sq.dimensions.TIME)
+        # this can be omitted?
+        elif isinstance(src_arrs[0], Collection):
+            dst_arrs = []
+            # merge collection results
+            for collection in src_arrs:
+                grouper_vals = [x.name for x in collection]
+                arr = xr.concat([x for x in collection], dim="grouper")
+                arr = arr.assign_coords(grouper=grouper_vals)
+                dst_arrs.append(arr)
+            # merge across time
+            dst_arr = xr.concat(dst_arrs, dim=sq.dimensions.TIME)
+        else:
+            raise NotImplementedError(f"No method for merging source array {src_arrs}.")
+        return dst_arr
 
-    @staticmethod
-    def _execute_workflow(context):
-        """Execute the workflow and handle response."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            try:
-                qp = QueryProcessor.parse(**context)
-                response = qp.optimize().execute()
-                return qp, response
-            except exceptions.EmptyDataError as e:
-                warnings.warn(e)
-                return None, None
-
-    @staticmethod
-    def get_op_dims(recipe_piece, dims=None):
-        """Retrieves the dimensions over which operations take place.
-        All operations indicated by verbs (such as reduce, groupby, etc) are considered.
+    def _postprocess_spatial(self, in_dict):
+        """Postprocesses the response to ensure homogeneous response format,
+        i.e. a dictionary containing xarrays with a at most 3 dimensions
         """
-        if dims is None:
-            dims = []
-        if isinstance(recipe_piece, dict):
-            # check if this dictionary matches the criteria
-            if recipe_piece.get("type") == "verb":
-                dim = recipe_piece.get("params").get("dimension")
-                if dim:
-                    dims.append(dim)
-            # recursively search for values
-            for value in recipe_piece.values():
-                TileHandler.get_op_dims(value, dims)
-        elif isinstance(recipe_piece, list):
-            # if it's a list apply the function to each item in the list
-            for item in recipe_piece:
-                TileHandler.get_op_dims(item, dims)
-        # categorise used dimensions into temporal & spatial dimensions
-        dim_lut = {
-            sq.dimensions.TIME: sq.dimensions.TIME,
-            sq.dimensions.SPACE: sq.dimensions.SPACE,
-        }
-        dim_lut.update(
-            {
-                x: sq.dimensions.TIME
-                for x in TileHandler._get_class_components(sq.components.time).values()
-            }
-        )
-        dim_lut.update(
-            {
-                x: sq.dimensions.SPACE
-                for x in TileHandler._get_class_components(sq.components.space).values()
-            }
-        )
-        _dims = []
-        for x in dims:
-            try:
-                _dims.append(dim_lut[x])
-            except KeyError:
-                pass
-        dims = list(np.unique(_dims))
-        return dims
+        out_dict = {}
+        for k in in_dict.keys():
+            in_arr = in_dict[k]
+            # convert collections (grouped outputs) into arrays
+            # problematic since grouper variable may exist already
+            # needed for grouped outputs!
+            if isinstance(in_arr, Collection):
+                grouper_vals = [x.name for x in in_arr]
+                if isinstance(grouper_vals[0], tuple):
+                    grouper_vals = [str(x) for x in grouper_vals]
+                in_arr = xr.concat([x for x in in_arr], dim="_grouper")
+                in_arr = in_arr.assign_coords(_grouper=grouper_vals)
+            # add crs information
+            in_arr = in_arr.rio.write_crs(self.crs)
+            # flatten 4D outputs to 3D
+            re_dims = TileHandler._get_nonspatial_dims(in_arr)
+            if len(re_dims) > 1:
+                in_arr = in_arr.stack(grouper=re_dims)
+                in_arr = in_arr.transpose("grouper", ...)
+            # persist band names for 3D outputs
+            re_dims = TileHandler._get_nonspatial_dims(in_arr)
+            if len(re_dims):
+                re_dim = re_dims[0]
+                re_vals = [str(x) for x in in_arr[re_dim].values]
+                in_arr.attrs["long_name"] = re_vals
+                in_arr.attrs["band_variable"] = re_dim
+            # add spatial information if missing
+            in_arr = TileHandler._write_transform(in_arr, self.spatial_resolution)
+            out_dict[k] = in_arr
+        return out_dict
 
-    @staticmethod
-    def create_temporal_grid(t_start, t_end, chunksize_t):
-        time_grid = pd.date_range(t_start, t_end, freq=chunksize_t)
-        time_grid = (
-            [pd.Timestamp(t_start), *time_grid]
-            if t_start not in time_grid
-            else time_grid
-        )
-        time_grid = (
-            [*time_grid, pd.Timestamp(t_end)] if t_end not in time_grid else time_grid
-        )
-        time_grid = [x for x in zip(time_grid, time_grid[1:])]
-        time_grid = [TemporalExtent(*t) for t in time_grid]
-        return time_grid
+    def _postprocess_temporal(self, in_dict):
+        """Postprocesses the response to ensure homogeneous response format"""
+        out_dict = {}
+        for k in in_dict.keys():
+            in_arr = in_dict[k]
+            # convert collections (grouped outputs) into arrays
+            if isinstance(in_arr, Collection):
+                grouper_vals = [x.name for x in in_arr]
+                in_arr = xr.concat([x for x in in_arr], dim="_grouper")
+                in_arr = in_arr.assign_coords(_grouper=grouper_vals)
+            out_dict[k] = in_arr
+        return out_dict
 
     @staticmethod
     def create_spatial_grid(
@@ -860,6 +766,80 @@ class TileHandler:
         return spatial_grid
 
     @staticmethod
+    def create_temporal_grid(t_start, t_end, chunksize_t):
+        time_grid = pd.date_range(t_start, t_end, freq=chunksize_t)
+        time_grid = (
+            [pd.Timestamp(t_start), *time_grid]
+            if t_start not in time_grid
+            else time_grid
+        )
+        time_grid = (
+            [*time_grid, pd.Timestamp(t_end)] if t_end not in time_grid else time_grid
+        )
+        time_grid = [x for x in zip(time_grid, time_grid[1:])]
+        time_grid = [TemporalExtent(*t) for t in time_grid]
+        return time_grid
+
+    @staticmethod
+    def get_op_dims(recipe_piece, dims=None):
+        """Retrieves the dimensions over which operations take place.
+        All operations indicated by verbs (such as reduce, groupby, etc) are considered.
+        """
+        if dims is None:
+            dims = []
+        if isinstance(recipe_piece, dict):
+            # check if this dictionary matches the criteria
+            if recipe_piece.get("type") == "verb":
+                dim = recipe_piece.get("params").get("dimension")
+                if dim:
+                    dims.append(dim)
+            # recursively search for values
+            for value in recipe_piece.values():
+                TileHandler.get_op_dims(value, dims)
+        elif isinstance(recipe_piece, list):
+            # if it's a list apply the function to each item in the list
+            for item in recipe_piece:
+                TileHandler.get_op_dims(item, dims)
+        # categorise used dimensions into temporal & spatial dimensions
+        dim_lut = {
+            sq.dimensions.TIME: sq.dimensions.TIME,
+            sq.dimensions.SPACE: sq.dimensions.SPACE,
+        }
+        dim_lut.update(
+            {
+                x: sq.dimensions.TIME
+                for x in TileHandler._get_class_components(sq.components.time).values()
+            }
+        )
+        dim_lut.update(
+            {
+                x: sq.dimensions.SPACE
+                for x in TileHandler._get_class_components(sq.components.space).values()
+            }
+        )
+        _dims = []
+        for x in dims:
+            try:
+                _dims.append(dim_lut[x])
+            except KeyError:
+                pass
+        dims = list(np.unique(_dims))
+        return dims
+
+    @staticmethod
+    def _execute_workflow(context):
+        """Execute the workflow and handle response."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            try:
+                qp = QueryProcessor.parse(**context)
+                response = qp.optimize().execute()
+                return qp, response
+            except exceptions.EmptyDataError as e:
+                warnings.warn(e)
+                return None, None
+
+    @staticmethod
     def _get_class_components(class_obj):
         """
         Function to get all components of the class along with their values
@@ -871,6 +851,28 @@ class TileHandler:
             ):
                 components[attribute] = getattr(class_obj, attribute)
         return components
+
+    @staticmethod
+    def _get_nonspatial_dims(in_arr):
+        arr_dims = list(in_arr.dims)
+        if sq.dimensions.X in arr_dims:
+            arr_dims.remove(sq.dimensions.X)
+        if sq.dimensions.Y in arr_dims:
+            arr_dims.remove(sq.dimensions.Y)
+        return arr_dims
+
+    @staticmethod
+    def _write_to_origin(arr, path):
+        """
+        Write an opened rioxarray back to its original path,
+        circumvents permission errors by temporarily writing to a new path
+        & renaming afterwards
+        """
+        suffix = str(uuid.uuid4()).replace("-", "_")
+        base, ext = os.path.splitext(path)
+        temp_path = f"{base}_{suffix}_{ext}"
+        arr.rio.to_raster(temp_path)
+        shutil.move(temp_path, path)
 
     @staticmethod
     def _write_transform(arr, res):
@@ -896,29 +898,31 @@ class TileHandler:
             arr.rio.write_transform(transform, inplace=True)
         return arr
 
-    @staticmethod
-    def _write_to_origin(arr, path):
-        """
-        Write an opened rioxarray back to its original path,
-        circumvents permission errors by temporarily writing to a new path
-        & renaming afterwards
-        """
-        suffix = str(uuid.uuid4()).replace("-", "_")
-        base, ext = os.path.splitext(path)
-        temp_path = f"{base}_{suffix}_{ext}"
-        arr.rio.to_raster(temp_path)
-        shutil.move(temp_path, path)
-
 
 class TileHandlerParallel(TileHandler):
-    """Handler for executing a query in a tiled manner leveraging multiprocessing.
-    The heavyweight and repetitive initialisation via preview() is carried out once and
-    then tiles are processed in parallel.
+    """Handler for executing a query in a tiled manner leveraging
+    multiprocessing. The heavyweight and repetitive initialisation via
+    preview() is carried out once and then tiles are processed in parallel.
 
-    Note that for STACCubes, parallel processing is per default already enabled for data loading. Parallel processing via TileHandlerParallel therefore only makes sense if the workflow encapsulated in the recipe is significantly more time-consuming than the actual data loading. It must also be noted that the available RAM resources must be sufficient to process, n_procs times the amount of data that arises in the case of a simple TileHandler. This usually requires an adjustment of the chunksizes, which in turn may increase the amount of redundant data fetching processes (because the same data may be loaded for neighbouring smaller tiles). The possible advantage of using the ParallelProcessor therefore depends on the specific recipe and is not trivial. In case of doubt, the use of the TileHandler without multiprocessing is recommended.
+    Note that for STACCubes, parallel processing is per default already
+    enabled for data loading. Parallel processing via TileHandlerParallel
+    only makes sense if the workflow encapsulated in the recipe is
+    significantly more time-consuming than the actual data loading. It
+    must also be noted that the available RAM resources must be sufficient
+    to process, n_procs times the amount of data that arises in the case of
+    a simple TileHandler. This usually requires an adjustment of the
+    chunksizes, which in turn may increase the amount of redundant data
+    fetching processes (because the same data may be loaded for neighbouring
+    smaller tiles). The possible advantage of using the ParallelProcessor
+    depends on the specific recipe and is not trivial. In case of doubt,
+    the use of the TileHandler without multiprocessing is recommended.
 
-    Note that the multiprocessing environment isolates the main process from the worker processes and ressources need to be serializable to be shared among worker processes. This implies that:
-    A) Custom functions (verb, operators, reducers) need to be defined in a self-contained way, i.e. including imports such as `import semantique as sq` at their beginning.
+    Note that the multiprocessing environment isolates the main process
+    from the worker processes and resources need to be serializable to be
+    shared among worker processes. This implies that:
+    A) Custom functions (verb, operators, reducers) need to be defined in
+    a self-contained way, i.e. including imports such as `import semantique
+    as sq` at their beginning.
     B) Reauth mechanisms relying on threaded processes won't work.
     """
 
