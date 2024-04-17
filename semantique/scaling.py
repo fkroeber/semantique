@@ -828,16 +828,28 @@ class TileHandler:
 
     @staticmethod
     def _execute_workflow(context):
-        """Execute the workflow and handle response."""
+        """
+        Execute the workflow and handle response.
+
+        Errors originating from empty datacubes can occur due
+        to tiling and need to be handled. Two different errors are
+        possible: EmptyDataErrors and ValueErrors, both originating
+        from datacube.retrieve() and often related to the option trim=True
+        being set in the datacube config or the parse_extent function.
+        """
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             try:
                 qp = QueryProcessor.parse(**context)
                 response = qp.optimize().execute()
                 return qp, response
-            except exceptions.EmptyDataError as e:
-                warnings.warn(e)
+            except exceptions.EmptyDataError:
                 return None, None
+            except ValueError as e:
+                if "zero-size array" in str(e):
+                    return None, None
+                else:
+                    raise
 
     @staticmethod
     def _get_class_components(class_obj):
