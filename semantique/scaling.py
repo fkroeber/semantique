@@ -598,6 +598,7 @@ class TileHandler:
                         attrs=arr_slice.attrs,
                     )
                     new_arr = new_arr.rio.write_crs(crs)
+                    new_arr = TileHandler._write_transform(new_arr, res)
                     arrs_sub.append(new_arr)
                 # spatial merge
                 merged_arr = merge_arrays(arrs_sub, crs=crs)
