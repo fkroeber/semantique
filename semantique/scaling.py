@@ -473,18 +473,6 @@ class TileHandler:
                 print(line_l * "-")
                 print("")
 
-    def _add_band_idx(self, in_arr):
-        """Introduce band coordinate as index variable."""
-        coords = {}
-        coords["band"] = (["band"], np.array([1]))
-        coords.update({dim: (dim, in_arr[dim].values) for dim in in_arr.dims})
-        out_arr = xr.DataArray(
-            data=np.expand_dims(in_arr.values, 0),
-            coords=coords,
-            attrs=in_arr.attrs,
-        )
-        return out_arr
-
     def _continuous_signing(self):
         """Calling resign function in a loop."""
         while not self.signing_thread_event.is_set():
@@ -537,7 +525,7 @@ class TileHandler:
                             coords = {
                                 c: (c, src_arr.coords[c].values) for c in src_arr.dims
                             }
-                            coords.update({band_dim: (band_dim, np.array([0]))})
+                            coords.update({band_dim: (band_dim, np.array([1]))})
                             new_band = xr.DataArray(
                                 nan_band, dims=src_arr.dims, coords=coords, name=band
                             )
@@ -587,16 +575,7 @@ class TileHandler:
                     except KeyError:
                         continue
                     # introduce band coordinate as index variable
-                    coords = {}
-                    coords["band"] = (["band"], np.array([1]))
-                    coords.update(
-                        {dim: (dim, arr_slice[dim].values) for dim in arr_slice.dims}
-                    )
-                    new_arr = xr.DataArray(
-                        data=np.expand_dims(arr_slice.values, 0),
-                        coords=coords,
-                        attrs=arr_slice.attrs,
-                    )
+                    new_arr = TileHandler._add_band_idx(arr_slice)
                     new_arr = new_arr.rio.write_crs(crs)
                     new_arr = TileHandler._write_transform(new_arr, res)
                     arrs_sub.append(new_arr)
@@ -605,7 +584,7 @@ class TileHandler:
                 merged_arr = merged_arr[0].drop_vars("band")
                 # re-introducing time dimension
                 coords = {}
-                coords[time_dim] = ([time_dim], np.array([time_val]))
+                coords[time_dim] = ([time_dim], np.array([str(time_val)]))
                 coords.update(
                     {dim: (dim, merged_arr[dim].values) for dim in merged_arr.dims}
                 )
@@ -627,14 +606,7 @@ class TileHandler:
             arrs = []
             for arr in src_arrs:
                 # introduce band coordinate as index variable
-                coords = {}
-                coords["band"] = (["band"], np.array([1]))
-                coords.update({dim: (dim, arr[dim].values) for dim in arr.dims})
-                new_arr = xr.DataArray(
-                    data=np.expand_dims(arr.values, 0),
-                    coords=coords,
-                    attrs=arr.attrs,
-                )
+                new_arr = TileHandler._add_band_idx(arr)
                 new_arr = new_arr.rio.write_crs(crs)
                 new_arr = TileHandler._write_transform(new_arr, res)
                 arrs.append(new_arr)
@@ -710,6 +682,19 @@ class TileHandler:
                 in_arr = in_arr.assign_coords(_grouper=grouper_vals)
             out_dict[k] = in_arr
         return out_dict
+
+    @staticmethod
+    def _add_band_idx(in_arr):
+        """Introduce band coordinate as index variable."""
+        coords = {}
+        coords["band"] = (["band"], np.array([1]))
+        coords.update({dim: (dim, in_arr[dim].values) for dim in in_arr.dims})
+        out_arr = xr.DataArray(
+            data=np.expand_dims(in_arr.values, 0),
+            coords=coords,
+            attrs=in_arr.attrs,
+        )
+        return out_arr
 
     @staticmethod
     def create_spatial_grid(
