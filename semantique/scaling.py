@@ -557,7 +557,7 @@ class TileHandler:
             arr_dims.remove(sq.dimensions.X)
         if sq.dimensions.Y in arr_dims:
             arr_dims.remove(sq.dimensions.Y)
-        # check if 2D/3D input arrays
+        # check if 3D input arrays
         if len(arr_dims):
             # possibly remaining dimension is the temporal one (e.g. year, season, etc)
             # retrieve temporal values
@@ -620,7 +620,6 @@ class TileHandler:
         if isinstance(src_arrs[0], xr.core.dataarray.DataArray):
             # merge across time
             dst_arr = xr.concat(src_arrs, dim=sq.dimensions.TIME)
-        # this can be omitted?
         elif isinstance(src_arrs[0], Collection):
             dst_arrs = []
             # merge collection results
@@ -637,7 +636,7 @@ class TileHandler:
 
     def _postprocess_spatial(self, in_dict):
         """Postprocesses the response to ensure homogeneous response format,
-        i.e. a dictionary containing xarrays with a at most 3 dimensions
+        i.e. a dictionary containing xarrays with at most 3 dimensions
         """
         out_dict = {}
         for k in in_dict.keys():
@@ -665,6 +664,16 @@ class TileHandler:
                 re_vals = [str(x) for x in in_arr[re_dim].values]
                 in_arr.attrs["long_name"] = re_vals
                 in_arr.attrs["band_variable"] = re_dim
+                # merge multilevel-indices into single-level indices
+                coords = {}
+                coords.update({dim: (dim, in_arr[dim].values) for dim in in_arr.dims})
+                coords[re_dim] = (re_dim, in_arr.attrs["long_name"])
+                in_arr = xr.DataArray(
+                    data=in_arr.values,
+                    coords=coords,
+                    attrs=in_arr.attrs,
+                )
+                in_arr = in_arr.rio.write_crs(self.crs)
             # add spatial information if missing
             in_arr = TileHandler._write_transform(in_arr, self.spatial_resolution)
             out_dict[k] = in_arr
