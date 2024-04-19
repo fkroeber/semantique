@@ -59,8 +59,42 @@ class TileHandler:
       chunksize_s : int, tbd
         Spatial chunksize
       tile_dim : tbd
-      merge : one of ["vrt", "single", None]
-      out_dir : str
+      merge_mode: Mode of how tiled results shall be merged. Options are None,
+      "merged", "vrt_tiles", "vrt_shapes".
+          None - Tiled results will be returned as provided by
+              `QueryProcessor.execute()` and stored in a list accessible as
+              `self.tile_results`.
+          "merged" - Tiled results will be postprocessed to ensure at most 3D
+                  array-like outputs and will then be spatio-temporally merged.
+                  It represents a balance between the highest possible similarity
+                  of the result to a run of the recipes without `TileHandler` and
+                  the practical reusability of the results (since everything is
+                  available as a maximum three-module array that can be easily
+                  processed further). This is the default option.
+          "vrt_shapes" - Tiled results will be postprocessed to ensure at most 3D
+                      array-like outputs. They will be stored as individual,
+                      irregularly shaped tiles and a virtual raster will be
+                      created. This option is only available for spatially not
+                      temporally tiled processing. It is useful for large or
+                      spatially irregularly arranged outputs that cannot be
+                      merged directly into a single output.
+          "vrt_tiles" - Tiled results will be postprocessed to ensure at most 3D
+                      array-like outputs. They will be stored as individual,
+                      regularly shaped tiles and a virtual raster will be created.
+                      This option is only available for spatially not temporally
+                      tiled processing. It is useful if the uniformity of the
+                      output styles is relevant (e.g., because the output is to be
+                      used as patch input for a subsequent neural network model).
+                      However, the regular tiling (without strict cropping to the
+                      spatio-temporal AOI extent) results in a slightly increased
+                      data volume output compared to "vrt_shapes".
+      out_dir: Output directory to write results to. Options are None or a string to
+              an output directory. This option is interdependent with the merge_mode:
+          None - Only available if merge_mode is in [None, "merged"]. Outputs won't be
+              written to disk but will be accessible via `self.tile_results`.
+          <output path> - Only available for ["merged", "vrt_shapes", "vrt_tiles"].
+                    Outputs will be written to the specified path and additionally be
+                    accessible via `self.tile_results`.
       caching : bool
       reauth : bool
       verbose : bool
@@ -85,7 +119,7 @@ class TileHandler:
         chunksize_t="1W",
         chunksize_s=1024,
         tile_dim=None,
-        merge="single",
+        merge_mode="merged",
         out_dir=None,
         caching=False,
         reauth=True,
@@ -102,7 +136,7 @@ class TileHandler:
         self.chunksize_t = chunksize_t
         self.chunksize_s = chunksize_s
         self.tile_dim = tile_dim
-        self.merge = merge
+        self.merge_mode = merge_mode
         self.out_dir = out_dir
         self.caching = caching
         self.reauth = reauth
@@ -117,15 +151,19 @@ class TileHandler:
             self.crs = self.space.crs
         # retrieve tiling dimension
         self.get_tile_dim()
-        # check merge-dependent prerequisites
-        if self.merge == "vrt" and self.tile_dim == sq.dimensions.TIME:
-            raise NotImplementedError(
-                "If tiling is done along the temporal dimension, 'vrt' is "
-                "currently not available as a merge strategy."
-            )
-        elif (self.merge == "vrt" or self.merge is None) and not self.out_dir:
+        # check merge- & outdir-dependent prerequisites
+        if not self.merge_mode and self.out_dir:
             raise ValueError(
-                f"An 'out_dir' argument must be provided when merge is set to {self.merge}."
+                f"'out_dir' must be set to None when merge is set to {self.merge_mode}."
+            )
+        elif "vrt" in self.merge_mode and not self.out_dir:
+            raise ValueError(
+                f"An 'out_dir' argument must be provided when merge is set to {self.merge_mode}."
+            )
+        elif "vrt" in self.merge_mode and self.tile_dim == sq.dimensions.TIME:
+            raise NotImplementedError(
+                "If tiling is done along the temporal dimension, 'vrt_*' is "
+                "currently not available as a merge strategy."
             )
         # create output directory
         if self.out_dir:
@@ -190,12 +228,7 @@ class TileHandler:
 
         elif self.tile_dim == sq.dimensions.SPACE:
             # create spatial grid
-            if self.merge == "vrt" or self.merge is None:
-                # tbd: allow both options of precise_shp here for both
-                # set default for both to True (to ensure consistent results)
-                # False only used for vrt to ensure same tile sizes (-> dl afterwards) & easier estimation of sizes
-                # both things not really needed
-                # precise_shp = True
+            if self.merge_mode == "vrt_tiles":
                 precise_shp = False
             else:
                 precise_shp = True
@@ -222,31 +255,32 @@ class TileHandler:
             )
             _, response = TileHandler._execute_workflow(context)
 
+            # missing response possible in cases where
+            # self.tile_dim = sq.dimensions.TIME & trim=True
             if response:
-                # postprocess response
-                if self.tile_dim == sq.dimensions.TIME:
-                    response = self._postprocess_temporal(response)
-                elif self.tile_dim == sq.dimensions.SPACE:
-                    response = self._postprocess_spatial(response)
-                # write result (in-memory or to disk)
-                if self.merge == "single":
+                if not self.merge_mode:
                     self.tile_results.append(response)
-                elif self.merge == "vrt" or self.merge is None:
-                    for layer in response.keys():
-                        # write to disk
-                        out_dir = os.path.join(self.out_dir, layer)
-                        out_path = os.path.join(out_dir, f"{i}.tif")
-                        os.makedirs(out_dir, exist_ok=True)
-                        response[layer].rio.to_raster(out_path)
-                        self.tile_results.append(out_path)
-            # missing reponse when self.tile_dim = sq.dimensions.TIME & trim=True
-            else:
-                pass
+                else:
+                    # postprocess response
+                    if self.tile_dim == sq.dimensions.TIME:
+                        response = self._postprocess_temporal(response)
+                    elif self.tile_dim == sq.dimensions.SPACE:
+                        response = self._postprocess_spatial(response)
+                    # write result (in-memory or to disk)
+                    if self.merge_mode == "merged":
+                        self.tile_results.append(response)
+                    else:
+                        for layer in response.keys():
+                            out_dir = os.path.join(self.out_dir, layer)
+                            out_path = os.path.join(out_dir, f"{i}.tif")
+                            os.makedirs(out_dir, exist_ok=True)
+                            response[layer].rio.to_raster(out_path)
+                            self.tile_results.append(out_path)
 
         # C) optional merge of results
-        if self.merge == "single":
+        if self.merge_mode == "merged":
             self.merge_single()
-        elif self.merge == "vrt":
+        elif "vrt" in self.merge_mode:
             self.merge_vrt()
 
     def merge_single(self):
@@ -266,10 +300,10 @@ class TileHandler:
                 )
             joint_arr.name = k
             joint_res[k] = joint_arr
-        self.joint_res = joint_res
+        self.tile_results = joint_res
         # write to out_dir
         if self.out_dir:
-            for k, v in self.joint_res.items():
+            for k, v in self.tile_results.items():
                 if self.tile_dim == sq.dimensions.TIME:
                     out_path = os.path.join(self.out_dir, f"{k}.nc")
                     v.to_netcdf(out_path)
@@ -300,11 +334,9 @@ class TileHandler:
             dst.close()
 
     def preview(self):
-        """Estimator to see if results can be given as one final object
-        or not.
-
-        Works by retrieving the tile size and testing the script for one
-        of the tiles.
+        """Estimator to preview the reipe and merge_mode dependent shapes
+        and sizes of the outputs. Retrieves the tile size and evaluates the
+        recipe for one of the tiles.
         """
         # preview info
         time_info = (
@@ -315,9 +347,9 @@ class TileHandler:
         )
         space_info = (
             "The following numbers are rough estimations depending on the chosen "
-            "strategy for merging the individual tile results. If merge='single' "
+            "strategy for merging the individual tile results. If merge='merged' "
             "is choosen the total size indicates a lower bound for how much RAM is "
-            "required since the individual tile results will be stored there before "
+            "required since the individual tile results will be stored in RAM before "
             "merging.\n"
         )
 
@@ -396,20 +428,20 @@ class TileHandler:
                         for x in vrt_scales
                     ]
                 )
-                lyr_info["merge"]["vrt"] = {}
-                lyr_info["merge"]["vrt"]["n"] = len(self.grid)
-                lyr_info["merge"]["vrt"]["size"] = size_tiles + size_vrt
-                lyr_info["merge"]["vrt"]["shape"] = (
+                lyr_info["merge"]["vrt_*"] = {}
+                lyr_info["merge"]["vrt_*"]["n"] = len(self.grid)
+                lyr_info["merge"]["vrt_*"]["size"] = size_tiles + size_vrt
+                lyr_info["merge"]["vrt_*"]["shape"] = (
                     *arr_z.shape,
                     self.chunksize_s,
                     self.chunksize_s,
                 )
                 # c) merge into single array
                 scale = xy_pixels / arr_xy.size
-                lyr_info["merge"]["single"] = {}
-                lyr_info["merge"]["single"]["n"] = 1
-                lyr_info["merge"]["single"]["size"] = scale * arr.nbytes / (1024**3)
-                lyr_info["merge"]["single"]["shape"] = (
+                lyr_info["merge"]["merged"] = {}
+                lyr_info["merge"]["merged"]["n"] = 1
+                lyr_info["merge"]["merged"]["size"] = scale * arr.nbytes / (1024**3)
+                lyr_info["merge"]["merged"]["shape"] = (
                     *arr_z.shape,
                     num_pixels_x,
                     num_pixels_y,
@@ -549,7 +581,6 @@ class TileHandler:
 
     def _merge_spatial(src_arrs, crs, res):
         """Merges spatially stratified results into an array"""
-        # tbd: remove superfluous parts here
         # get dimensions of input array
         arr_dims = list(src_arrs[0].dims)
         # remove spatial dimensions
@@ -956,9 +987,9 @@ class TileHandlerParallel(TileHandler):
         # flatten results
         self.tile_results = [x for sl in tile_results for x in sl]
         # merge results
-        if self.merge == "single":
+        if self.merge_mode == "merged":
             self.merge_single()
-        elif self.merge == "vrt":
+        elif "vrt" in self.merge_mode:
             self.merge_vrt()
 
     def _execute_tile(self, tile_idx, shared_self):
@@ -978,17 +1009,23 @@ class TileHandlerParallel(TileHandler):
         _, response = th._execute_workflow(context)
         # handle response
         if response:
-            # write result (in-memory or to disk)
-            if th.merge == "single":
+            if not th.merge_mode:
                 out = list(response)
-            elif th.merge == "vrt" or th.merge is None:
-                out = []
-                for layer in response:
-                    # write to disk
-                    out_dir = os.path.join(th.out_dir, layer)
-                    out_path = os.path.join(out_dir, f"{tile_idx}.tif")
-                    os.makedirs(out_dir, exist_ok=True)
-                    layer = response[layer].rio.write_crs(th.crs)
-                    layer.rio.to_raster(out_path)
-                    out.append(out_path)
+            else:
+                # postprocess response
+                if th.tile_dim == sq.dimensions.TIME:
+                    response = th._postprocess_temporal(response)
+                elif th.tile_dim == sq.dimensions.SPACE:
+                    response = th._postprocess_spatial(response)
+                # write result (in-memory or to disk)
+                if th.merge_mode == "merged":
+                    out = list(response)
+                else:
+                    for layer in response.keys():
+                        out_dir = os.path.join(th.out_dir, layer)
+                        out_path = os.path.join(out_dir, f"{tile_idx}.tif")
+                        os.makedirs(out_dir, exist_ok=True)
+                        layer = response[layer].rio.write_crs(th.crs)
+                        layer.rio.to_raster(out_path)
+                        out.append(out_path)
             return out
