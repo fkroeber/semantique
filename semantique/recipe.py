@@ -98,18 +98,19 @@ class QueryRecipe(dict):
             _ = fp.optimize().execute()
             cache = fp.cache
         else:
-            # Execute the query recipe without a preview run.
-            qp = QueryProcessor.parse(
-                self,
-                datacube,
-                mapping,
-                space,
-                time,
-                preview=run_preview,
-                cache=cache,
-                **config
-            )
-            return qp.optimize().execute()
+            cache = None
+        # Execute the query recipe without a preview run.
+        qp = QueryProcessor.parse(
+            self,
+            datacube,
+            mapping,
+            space,
+            time,
+            preview=run_preview,
+            cache=cache,
+            **config
+        )
+        return qp.optimize().execute()
 
     def visualise(self):
         """Visualise the recipe in a web browser.
