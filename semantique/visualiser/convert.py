@@ -81,11 +81,7 @@ class JsonToXmlConverter:
             ET.SubElement(prev_result, "field", name="name").text = key
             ET.SubElement(prev_result, "field", name="export").text = "true"
             instructs = ET.SubElement(prev_result, "value", name="instructions")
-            instructs_block = ET.SubElement(
-                instructs, "block", type=value["type"], id=self._gen_id()
-            )
-            self.handle_with(instructs_block, value["with"])
-            self.handle_do(instructs_block, value["do"])
+            self.find_handler(instructs, value)
 
     def find_handler(self, parent, obj):
         """Calls the dedicated handler for a building block."""
@@ -106,9 +102,10 @@ class JsonToXmlConverter:
         )
         custom_props = deepcopy(obj["params"])
         custom_props.pop("verb", None)
-        ET.SubElement(block, "field", name="custom_props").text = ", ".join(
-            [f"{key} = {str(value)}" for key, value in custom_props.items()]
-        )
+        if len(custom_props):
+            ET.SubElement(block, "field", name="custom_props").text = ", ".join(
+                [f"{key} = {str(value)}" for key, value in custom_props.items()]
+            )
 
     def handle_assign(self, parent, obj):
         if "at" in obj["params"]:
