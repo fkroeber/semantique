@@ -1,6 +1,5 @@
-from semantique.processor.core import QueryProcessor, FakeProcessor
+from semantique.processor.core import QueryProcessor, FakeProcessor, FilterProcessor
 from semantique.visualiser.visualise import show
-
 
 class QueryRecipe(dict):
     """Dict-like container to store instructions of a query recipe.
@@ -30,44 +29,50 @@ class QueryRecipe(dict):
         obj = {} if results is None else results
         super(QueryRecipe, self).__init__(obj)
 
-    def execute(
-        self,
-        datacube,
-        mapping,
-        space,
-        time,
-        run_preview=False,
-        cache_data=True,
-        **config
+  def execute(
+      self,
+      datacube,
+      mapping,
+      space,
+      time,
+      filter_check = True,
+      run_preview = False,
+      cache_data = True,
+      **config
     ):
-        """Execute a query recipe.
+    """Execute a query recipe.
 
         This function initializes a :obj:`processor.core.QueryProcessor` instance
         and uses it to process the query. It runs through all distinct phases of
         query processing: parsing, optimization and execution.
 
-        Parameters
-        ----------
-          datacube : Datacube
-            The datacube instance to process the query against.
-          mapping : Mapping
-            The mapping instance to process the query against.
-          space : SpatialExtent
-            The spatial extent in which the query should be processed.
-          time : TemporalExtent
-            The temporal extent in which the query should be processed.
-          run_preview : :obj:`bool`
-            Should a preview run with reduced spatial resolution be performed?
-            A preview run enables to test if the recipe execution succeeds
-            and allows to inspect the results.
-          cache_data : :obj:`bool`
-            Should the query processor cache the data references as provided by the
-            mapped concepts? Enabling caching increases the memory footprint while
-            reducing the I/O time to retrieve data if the same data layer is
-            referenced multiple times.
-          **config:
-            Additional configuration parameters forwarded to
-            :func:`QueryProcessor.parse <processor.core.QueryProcessor.parse>`.
+    Parameters
+    ----------
+      datacube : Datacube
+        The datacube instance to process the query against.
+      mapping : Mapping
+        The mapping instance to process the query against.
+      space : SpatialExtent
+        The spatial extent in which the query should be processed.
+      time : TemporalExtent
+        The temporal extent in which the query should be processed.
+      filter_check : :obj:`bool`
+        Should the query processor evaluate possible temporal filter operations
+        upfront? This can reduce the amount of data to be processed in the
+        subsequent evaluation process. If the recipe doesn't contain any
+        temporal filter operations, this flag has no effect.
+      run_preview : :obj:`bool`
+        Should a preview run with reduced spatial resolution be performed?
+        A preview run enables to test if the recipe execution succeeds
+        and allows to inspect the results.
+      cache_data : :obj:`bool`
+        Should the query processor cache the data references as provided by the
+        mapped concepts? Enabling caching increases the memory footprint while
+        reducing the I/O time to retrieve data if the same data layer is
+        referenced multiple times.
+      **config:
+        Additional configuration parameters forwarded to
+        :func:`QueryProcessor.parse <processor.core.QueryProcessor.parse>`.
 
         Returns
         -------
@@ -92,32 +97,45 @@ class QueryRecipe(dict):
 
         >>> recipe.execute(dc, mapping, space, time, **config)
 
-        """
-        if cache_data:
-            fp = FakeProcessor.parse(self, datacube, mapping, space, time, **config)
-            _ = fp.optimize().execute()
-            cache = fp.cache
-        else:
-            cache = None
+    """
+    if filter_check:
+      # Use FilterProcessor to retrieve required minimum set of data IDs
+      fip = FilterProcessor.parse(self, datacube, mapping, space, time, **config)
+      _ = fip.optimize().execute()
+      # Update datacube according to FilterProcessor
+      datacube = fip.datacube
+      # Retrieve cache from fake processor instance as part of the filter processor
+      if cache_data:
+        cache = fip.fap.cache
+      else:
+        cache = None
+    else:
+      # Retrieve cache from standalone fake processor instance
+      if cache_data:
+        fap = FakeProcessor.parse(self, datacube, mapping, space, time, **config)
+        _ = fap.optimize().execute()
+        cache = fap.cache
+      else:
+        cache = None
 
-        qp = QueryProcessor.parse(
-            self,
-            datacube,
-            mapping,
-            space,
-            time,
-            preview=run_preview,
-            cache=cache,
-            **config
-        )
-        return qp.optimize().execute()
+    qp = QueryProcessor.parse(
+      self,
+      datacube,
+      mapping,
+      space,
+      time,
+      preview=run_preview,
+      cache=cache,
+      **config
+    )
+    return qp.optimize().execute()
 
-    def visualise(self):
-        """Visualise the recipe in a web browser.
+  def visualise(self):
+    """Visualise the recipe in a web browser.
 
-        This method visualises the recipe in a web browser.
-        The visualisation is based on Blockly, a web-based visual programming
-        editor. The recipe is converted into Blockly XML format and served
-        to the browser.
-        """
-        show(self)
+    This method visualises the recipe in a web browser. 
+    The visualisation is based on Blockly, a web-based visual programming
+    editor. The recipe is converted into Blockly XML format and served
+    to the browser.
+    """
+    show(self)
