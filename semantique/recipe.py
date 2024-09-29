@@ -2,32 +2,32 @@ from semantique.processor.core import QueryProcessor, FakeProcessor, FilterProce
 from semantique.visualiser.visualise import show
 
 class QueryRecipe(dict):
-    """Dict-like container to store instructions of a query recipe.
+  """Dict-like container to store instructions of a query recipe.
 
-    Parameters
-    ----------
-      results : :obj:`dict` of :obj:`ArrayProxy`
-        Dictionary containing result names as keys and result instructions as
-        values. If :obj:`None`, an empty recipe is constructed.
+  Parameters
+  ----------
+    results : :obj:`dict` of :obj:`ArrayProxy`
+      Dictionary containing result names as keys and result instructions as
+      values. If :obj:`None`, an empty recipe is constructed.
 
-    Returns
-    -------
-      :obj:`dict` of :obj:`ArrayProxy`:
-        The query recipe as a dictionary containing result names as keys and
-        result instructions as values.
+  Returns
+  -------
+    :obj:`dict` of :obj:`ArrayProxy`:
+      The query recipe as a dictionary containing result names as keys and
+      result instructions as values.
 
-    Examples
-    --------
-    >>> import semantique as sq
-    >>> recipe = sq.QueryRecipe()
-    >>> recipe["map"] = sq.entity("water").reduce("time", "count")
-    >>> recipe["series"] = sq.entity("water").reduce("space", "count")
+  Examples
+  --------
+  >>> import semantique as sq
+  >>> recipe = sq.QueryRecipe()
+  >>> recipe["map"] = sq.entity("water").reduce("time", "count")
+  >>> recipe["series"] = sq.entity("water").reduce("space", "count")
 
-    """
+  """
 
-    def __init__(self, results=None):
-        obj = {} if results is None else results
-        super(QueryRecipe, self).__init__(obj)
+  def __init__(self, results=None):
+      obj = {} if results is None else results
+      super(QueryRecipe, self).__init__(obj)
 
   def execute(
       self,
