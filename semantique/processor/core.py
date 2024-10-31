@@ -448,7 +448,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     Raises
     ------
@@ -486,7 +487,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     out = self._get_eval_obj()
@@ -522,7 +524,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     obj = self.call_handler(block["with"])
@@ -542,7 +545,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     out = self.call_handler(block, key = "name")
@@ -561,7 +565,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -595,7 +600,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     return self.call_verb("extract", block["params"])
@@ -611,7 +617,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -634,7 +641,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -694,7 +702,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -717,7 +726,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     return self.call_verb("shift", block["params"])
@@ -733,7 +743,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -756,7 +767,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     return self.call_verb("trim", block["params"])
@@ -772,7 +784,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get and update function parameters.
@@ -792,7 +805,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -813,7 +827,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     return self.call_verb("name", block["params"])
@@ -829,7 +844,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get function parameters.
@@ -1081,7 +1097,8 @@ class QueryProcessor():
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or
+      :obj:`Collection <semantique.processor.arrays.Collection>`
 
     """
     # Get the object to apply the verb to.
@@ -1270,7 +1287,8 @@ class FakeProcessor(QueryProcessor):
 
     Returns
     -------
-      :obj:`xarray.DataArray` or :obj:`Collection <semantique.processor.arrays.Collection>`
+      :obj:`xarray.DataArray` or 
+      :obj:`Collection <semantique.processor.arrays.Collection>`
     """
     return self._get_eval_obj()
 
@@ -1508,11 +1526,15 @@ class FilterProcessor(QueryProcessor):
             # Note: Contrary to ODC, .retrieve_metadata() can be called immediately
             # since the metadata is already stored in the STACCube. Hence, no performance
             # advantage by resolving products (=items instead of assets) first.
+            # What we need instead though is an LuT to map layer names back to
+            # the respective references.
             meta_dfs = []
+            lyr_ref_lut = {}
             for lyr in list(set(self.fap.cache.seq)):
               df = self.datacube.retrieve_metadata(*lyr, extent=self._extent)
               df.insert(0, "lyr", "_".join(lyr))
               meta_dfs.append(df)
+              lyr_ref_lut["_".join(lyr)] = lyr
               logger.debug(f"Retrieved meta information for layer {lyr}:\n {df}")
               logger.debug(f"Unique timestamps: {len(df.drop_duplicates(['time']))}")
             meta_df = pd.concat(meta_dfs).reset_index(drop=True)
@@ -1555,7 +1577,10 @@ class FilterProcessor(QueryProcessor):
                   if np.issubdtype(arr.dtype, np.datetime64):
                     v[i] = xr.ones_like(arr, dtype="int32")
               if type(v.sqm).__name__ == 'MetaCollection':
-                self._response[lyr][k] = v.sqm.merge(reducers.any_, track_types=False)
+                self._response[lyr][k] = v.sqm.merge(
+                  reducers.any_,
+                  track_types=False
+                )
           # Retrieve valid temporal indices per layer and result.
           # Valid indices are those that are not null.
           response = copy.deepcopy(self._response)
@@ -1578,7 +1603,11 @@ class FilterProcessor(QueryProcessor):
               # Combine results from array and vault.
               if len(out):
                 if len(out) > 1:
-                  out = xr.DataArray(np.unique(np.concatenate(out)), dims="time", name="time")
+                  out = xr.DataArray(
+                    np.unique(np.concatenate(out)),
+                    dims="time",
+                    name="time"
+                  )
                 else:
                   out = out[0]
                 response[lyr][res] = out
@@ -1618,12 +1647,17 @@ class FilterProcessor(QueryProcessor):
     # Step 3: Update datacube dataset according to valid timestamps.
     if meta_retrieved:
       # Copy datacube to update.
-      _datacube = copy.deepcopy(self.datacube)
       if type(self.datacube) == datacube.Opendatacube:
+        # Copy datacube.
+        dc_con = self.datacube.connection
+        self.datacube.connection = None
+        _datacube = copy.deepcopy(self.datacube)
+        _datacube.connection = dc_con
+        self.datacube.connection = dc_con
         # Extract valid dataset ids corresponding to timestamps.
         id_dict = {}
         for k,v in self._response.items():
-          ids = meta_df[meta_df.lyr == k][meta_df.time.isin(pd.Series(v))].id
+          ids = meta_df[(meta_df.lyr == k) & (meta_df.time.isin(pd.Series(v)))].id
           id_dict[k] = list(ids)
           logger.debug(f"Temporally filtered results for layer {k}")
           logger.debug(f"- unique timestamps: {len(np.unique(v))}")
@@ -1631,21 +1665,30 @@ class FilterProcessor(QueryProcessor):
         _datacube.data_dict = id_dict
         self.datacube = _datacube
       elif type(self.datacube) == datacube.STACCube:
+        # Copy datacube.
+        _datacube = copy.deepcopy(self.datacube)
         _datacube.src = pystac.ItemCollection(self.datacube.src)
         # Extract valid collection_item_Ids corresponding to timestamps.
-        id_list = []
+        id_df = pd.DataFrame()
         for k,v in self._response.items():
-          ids = meta_df[meta_df.lyr == k][meta_df.time.isin(pd.Series(v))].id
-          id_list.extend(list(ids))
+          lyr_name = self.datacube.lookup(*lyr_ref_lut[k])["name"]
+          ids = meta_df[(meta_df.lyr == k) & (meta_df.time.isin(pd.Series(v)))].id
+          id_df = pd.concat([id_df, pd.DataFrame({"prod": ids, "lyr" : lyr_name})])
           logger.debug(f"Temporally filtered results for layer {k}")
           logger.debug(f"- unique timestamps: {len(np.unique(v))}")
           logger.debug(f"- unique items: {len(ids)}")
-        id_list = list(set(id_list))
-        # Subset item as input to datacube correspondigly.
-        if len(id_list):
+        id_df = id_df.groupby("prod").lyr.unique().reset_index()
+        # Subset items & assets as input to datacube correspondingly.
+        if len(id_df):
           filtered_items = []
           for item in _datacube.src:
-            if (item.get_collection().id, item.id) in id_list:
+            item_id = (item.get_collection().id, item.id)
+            df_subset = id_df[id_df["prod"].isin([item_id])]
+            if len(df_subset):
+              asset_dict = {}
+              for asset in df_subset["lyr"].iloc[0]:
+                asset_dict[asset] = item.assets[asset]
+              item.assets = asset_dict
               filtered_items.append(item)
           _datacube.src = filtered_items
         else:
